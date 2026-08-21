@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dryrun:
+    # 这里只跑「不碰浏览器就能验」的那一半。
+    # 开标签页、选档位、注入正文、发送、判完成 —— 全都测不到，
+    # 那些必须在有已登录 ChatGPT 的真实 Chrome 上手动跑一次。
+    name: 干跑清单 · Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 确认零第三方依赖
+        run: |
+          # 这个项目只用标准库。有人加了 import 第三方包要立刻发现。
+          ! grep -rnE '^\s*(import|from)\s+(requests|httpx|playwright|selenium|websocket|websockets|yaml|bs4|lxml|aiohttp)\b' bin/ \
+            || { echo "::error::bin/ 里出现了第三方依赖 import —— 本项目只用标准库"; exit 1; }
+
+      - name: git 身份（cgh 需要一个可提交的临时仓库）
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name  ci
+
+      - run: ./scripts/dryrun.sh
+
+  hygiene:
+    name: 仓库卫生
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 不得混入凭证
+        run: |
+          ! git grep -nIE 'gh[pousr]_[A-Za-z0-9]{20}|github_pat_[A-Za-z0-9_]{20}|sk-[a-zA-Z0-9]{20}|-----BEGIN [A-Z ]*PRIVATE KEY' -- . \
+            || { echo "::error::仓库里出现疑似凭证"; exit 1; }
+
+      - name: 不得提交 handoff 作业产物
+        run: |
+          # request.md 里装的是使用者的代码上下文，result.md 是外部模型输出，都不该进 git
+          ! git ls-files | grep -E '\.chatgpt/web-handoff/.+' | grep -v '\.gitkeep$' \
+            || { echo "::error::作业产物被提交了"; exit 1; }
+
+      - name: 安装脚本可用
+        run: |
+          bash -n scripts/install.sh
+          HOME="$(mktemp -d)" bash scripts/install.sh || true   # 无 Chrome 环境下自检会报缺 CDP，只验不崩

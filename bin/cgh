@@ -1,0 +1,1523 @@
+#!/usr/bin/env python3
+"""cgh —— ChatGPT Web Handoff 的确定性外壳。
+
+做两件事：
+1. 作业账本：job_id、目录、job.json、并发闸门、模板渲染、哨兵解析、状态机；
+2. 浏览器编排：submit / poll 走 raw CDP（bin/cgh_cdp.py + bin/cgh_web.py）自己完成
+   开新会话、选档位、注入正文、发送、等真 URL、读进度这一整套。
+
+v0.4 起编排从 Skill 提示词下沉到这里。原因：靠提示词描述二十来步
+浏览器操作，每步都依赖模型现场判断，换个会话就要重学一遍，且实测踩中六个坑。
+
+作业目录、job.json 字段、状态机与哨兵格式的定义都在本文件里，这里就是真相源。
+"""
+
+import sys
+
+if sys.version_info < (3, 9):                      # 实测 3.9.6 可跑；再老没验证过
+    sys.stderr.write(
+        f"cgh 需要 Python >= 3.9，当前是 {sys.version.split()[0]}（{sys.executable}）。\n"
+        "指定解释器：CGH_PYTHON=/path/to/python3 ./scripts/install.sh\n")
+    raise SystemExit(2)
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import time
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # 穿 symlink 落到仓库 bin/
+
+SCHEMA_VERSION = 3      # 3：新增 origin（来源留痕）与 outcome（闭环留痕）
+ID_RE = re.compile(r"^hf_\d{8}_[0-9a-z]{6}$")
+ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+# 不放 auto：它没有对应的 UI 档位，new 收得下但 submit 必然 effort_not_found。
+# 要做智能选档就在 Skill 层决定具体档位再传进来。
+EFFORTS = {"instant", "medium", "high", "xhigh", "pro"}
+# 用户用中文口语点档位（极速/中级/高级/极高/pro），这里一次性收敛掉，
+# 免得每次都要在 Skill 提示词里让模型自己翻译。
+EFFORT_ALIASES = {
+    "pro_standard": "pro", "pro_extended": "pro",
+    "极速": "instant", "最快": "instant",
+    "中": "medium", "中级": "medium", "中等": "medium",
+    "高": "high", "高级": "high",
+    "极高": "xhigh", "超高": "xhigh",
+    "Pro": "pro", "PRO": "pro", "最高": "pro", "顶配": "pro",
+}
+ACTIONS = {"review", "design", "debug"}
+
+# 用户没点档位时用它。改这一行即可，不用动别处。
+DEFAULT_EFFORT = "xhigh"    # 极高。用户明确要求：默认就往高了走，别省
+
+# 从用户原话里认档位。刻意要求档位词紧挨着「模式/档」，或者是 pro/最高 这种
+# 本身就无歧义的说法——否则「高并发」「中间件」这类词会被误判成档位。
+EFFORT_IN_WORDS = [
+    (r"(?:^|[^a-zA-Z])pro(?![a-zA-Z])", "pro"),
+    (r"最高档?位?|顶配", "pro"),
+    (r"极速\s*(?:模式|档位?)?", "instant"),
+    (r"极高\s*(?:模式|档位?)?|超高\s*(?:模式|档位?)", "xhigh"),
+    (r"高级\s*(?:模式|档位?)|高\s*(?:模式|档位)", "high"),
+    (r"中级\s*(?:模式|档位?)?|中等\s*(?:模式|档位?)|中\s*(?:模式|档位)", "medium"),
+]
+
+
+def effort_from_words(text):
+    """从用户原话里认出档位；认不出返回 None。
+
+    存在的意义：`--effort` 的值是模型填的，没人校验它忠不忠于用户原话。
+    用户说「用 pro 模式」而模型填了 high，全链路不会报错——effort_actual 还会
+    回读成"正确的高"，事后查不出来。原话就在 intent.json 里，那就拿它当第二个信源。
+    """
+    for pattern, eff in EFFORT_IN_WORDS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return eff
+    return None
+
+# 成功终态只能顺着 FORWARD 走到；错误终态可以从任何非终态直接进入。
+# 两者不能混为一谈——否则 created 能一步跳 completed。
+SUCCESS_TERMINAL = {"completed", "no_sentinel"}
+ERROR_TERMINAL = {"effort_not_found", "model_changed", "rate_limited",
+                  "wrong_page", "ui_changed", "failed"}
+TERMINAL = SUCCESS_TERMINAL | ERROR_TERMINAL
+BLOCKED = {"auth_required", "remote_debug_denied", "send_unknown"}   # 非终态，等人工
+FORWARD = {
+    "created": {"prompt_ready"},
+    "prompt_ready": {"submitted"},
+    "submitted": {"submitted", "generating", "completed", "no_sentinel"},
+    "generating": {"generating", "completed", "no_sentinel"},
+    "auth_required": {"prompt_ready", "submitted"},
+    "remote_debug_denied": {"prompt_ready", "submitted"},
+    # 发送已经打出去、但没确认到对话 URL。只能人去浏览器看一眼，
+    # 绝不能自动重投——那会产生重复 handoff 并二次消耗档位额度。
+    "send_unknown": {"submitted"},
+}
+ALL_STATES = TERMINAL | BLOCKED | set(FORWARD)
+
+VERDICTS = {"pass", "revise", "reject"}
+LIST_FIELDS = ("findings", "recommended_actions", "missing_information")
+
+
+# ---------- 基础设施 ----------
+
+def die(code, msg, **extra):
+    payload = {"ok": False, "error": code, "message": msg}
+    payload.update(extra)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    sys.exit(1)
+
+
+def ok(**payload):
+    print(json.dumps({"ok": True, **payload}, ensure_ascii=False, indent=2))
+
+
+def now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def repo_root(start=None):
+    p = Path(start or os.getcwd()).resolve()
+    for d in (p, *p.parents):
+        if (d / ".git").exists():
+            return d
+    return p
+
+
+ARTIFACT_DIR = (".chatgpt", "web-handoff")
+LEGACY_DIR = (".ai", "handoffs")
+
+
+def handoffs_dir(root):
+    """产物目录：<repo>/.chatgpt/web-handoff/
+
+    v0.5 从 .ai/handoffs 改过来——`.ai` 太泛，一个仓库里可能有好几个 AI 工具的产物，
+    看目录名认不出是谁的。迁移是自动的、只做一次。
+    """
+    new = root.joinpath(*ARTIFACT_DIR)
+    old = root.joinpath(*LEGACY_DIR)
+    if old.is_dir() and not new.exists():
+        new.parent.mkdir(parents=True, exist_ok=True)
+        old.rename(new)                     # 同盘 rename 是原子的，跑到一半的作业不会丢
+        try:
+            old.parent.rmdir()              # .ai 空了就顺手删掉；非空则保留
+        except OSError:
+            pass
+        _migrate_gitignore(root)            # 目录改名后旧忽略规则就失效了，必须一起改
+    return new
+
+
+def _migrate_gitignore(root):
+    """把 .gitignore 里指向旧产物目录的规则换成新路径。
+
+    这一步不能省：产物含用户代码上下文与外部模型输出（硬约束 §10 禁止进 git）。
+    只改名目录、不改忽略规则，等于把它们直接暴露出去。
+    """
+    gi = root / ".gitignore"
+    if not gi.exists():
+        return
+    old_prefix = "/".join(LEGACY_DIR)
+    new_prefix = "/".join(ARTIFACT_DIR)
+    text = gi.read_text(encoding="utf-8")
+    if old_prefix not in text:
+        return
+    gi.write_text(text.replace(old_prefix, new_prefix), encoding="utf-8")
+
+
+def skill_dir():
+    return Path(__file__).resolve().parent.parent
+
+
+def new_id():
+    return "hf_{}_{}".format(
+        datetime.now().strftime("%Y%m%d"),
+        "".join(secrets.choice(ID_ALPHABET) for _ in range(6)),
+    )
+
+
+class BrowserLock:
+    """全机互斥，只保护「设档位 → 发送」这一两秒。
+
+    ChatGPT 的推理强度是**账号级持久化偏好**，跨标签页实时同步（2026-08-19 实测：
+    A 页改成极速，B 页不刷新就跟着变，且中途会短暂显示一个谁都没设过的中间值）。
+    所以两个 harness 同时提交、要的档位不同时，会互相把对方的档位改掉，
+    而各自回读都"正确"，事后查不出来。
+
+    这里刻意**不锁整个作业**：生成阶段（Pro 可达十分钟）不碰这个共享偏好，
+    锁它只会白白扼杀并发。锁住的只有 configure→send 这个真正的临界区。
+    """
+
+    def __init__(self, timeout=180):
+        self.path = Path.home() / ".cgh" / "browser.lock"
+        self.timeout = timeout
+        self.fd = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.ftruncate(self.fd, 0)
+                os.write(self.fd, f"{os.getpid()} {now()}\n".encode())
+                return self
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    os.close(self.fd)
+                    die("browser_busy",
+                        f"另一个 cgh 正在设档位/发送，等了 {self.timeout}s 仍未释放",
+                        lock=str(self.path),
+                        hint="正常情况下这一步只占一两秒；一直占着说明有进程卡死，检查后删掉该锁文件")
+                time.sleep(0.2)
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+class Lock:
+    """短时互斥，只保护 job.json 的读-改-写，不做跨进程长期占用。
+
+    「当前是否有活跃作业」由各 job.json 的 status 推导，不依赖锁文件残留。
+    """
+
+    def __init__(self, d):
+        self.path = d / ".lock"
+        self.fd = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+# ---------------------------------------------------------------- 留痕
+
+# 干跑测试要把账本指到别处，否则测试作业会污染真实的跨仓统计
+LEDGER = Path(os.environ.get("CGH_LEDGER") or (Path.home() / ".cgh" / "ledger.jsonl"))
+
+
+def _git_state(root):
+    def q(*args):
+        try:
+            r = subprocess.run(["git", "-C", str(root), *args],
+                               capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            return None
+    head = q("rev-parse", "--short", "HEAD")
+    return {"git_head": head,
+            "git_branch": q("rev-parse", "--abbrev-ref", "HEAD"),
+            "git_dirty": bool(q("status", "--porcelain")) if head else None}
+
+
+def detect_origin(root):
+    """记下「谁在什么状态下发起的这次交接」。
+
+    只按白名单取字段——**绝不遍历 env**，那里面有 CLAUDE_CODE_MESSAGING_TOKEN 这类东西。
+    transcript 只记真实存在的路径：宁可记 null，也不留一条查不到的线索。
+    """
+    e = os.environ
+    o = {"harness": "unknown", "ai_agent": e.get("AI_AGENT"),
+         "version": None, "session_id": None, "transcript": None}
+
+    if e.get("CLAUDECODE") or e.get("CLAUDE_CODE_SESSION_ID"):
+        o["harness"] = "claude-code"
+        o["version"] = e.get("CLAUDE_CODE_VERSION")
+        o["session_id"] = e.get("CLAUDE_CODE_SESSION_ID")
+        if o["session_id"]:
+            # 目录名是启动时 cwd 的 slug，不一定等于仓库根，所以搜一遍
+            hits = list((Path.home() / ".claude" / "projects").glob(f"*/{o['session_id']}.jsonl"))
+            o["transcript"] = str(hits[0]) if hits else None
+    elif e.get("CODEX_SESSION_ID"):
+        # Codex CLI 原生。会话记录：~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<sid>.jsonl
+        o["harness"] = "codex"
+        o["session_id"] = e.get("CODEX_SESSION_ID")
+        hits = list((Path.home() / ".codex" / "sessions").glob(
+            f"*/*/*/rollout-*-{o['session_id']}.jsonl"))
+        o["transcript"] = str(hits[0]) if hits else None
+    elif e.get("CODEX_COMPANION_SESSION_ID"):
+        o["harness"] = "codex-companion"
+        o["session_id"] = e.get("CODEX_COMPANION_SESSION_ID")
+        t = e.get("CODEX_COMPANION_TRANSCRIPT_PATH")
+        o["transcript"] = t if t and Path(t).exists() else None
+    else:
+        # 认不出的 harness（DSH 等）：AI_AGENT 原值照记，另外记下有哪些
+        # *_SESSION_ID 变量**的名字**（只记名字不记值）——下次看账本就知道该接哪个。
+        names = sorted(k for k in e if k.endswith("_SESSION_ID"))
+        if names:
+            o["session_env_names"] = names
+
+    o.update(_git_state(root))
+    o["cwd"] = str(root)
+    return o
+
+
+def ledger_append(ev, root, job, **extra):
+    """全机账本。作业散在各使用方仓库里，没有这个就没有跨仓视图。
+
+    append-only + flock —— 多仓库并发是本项目明确支持的场景，不能互相踩。
+    账本写失败绝不能影响 handoff 本身，所以整段吞异常。
+    """
+    try:
+        origin = job.get("origin") or {}
+        rec = {"ts": extra.pop("ts_override", None) or now(), "ev": ev, "repo": str(root), "id": job.get("id"),
+               "harness": origin.get("harness"), "session_id": origin.get("session_id"),
+               "action": job.get("action"), "subject": job.get("subject"),
+               "effort_requested": job.get("effort_requested"),
+               "effort_actual": job.get("effort_actual"),
+               "parent_id": job.get("parent_id"),
+               "conversation_url": job.get("conversation_url")}
+        rec.update(extra)
+        LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        with open(LEDGER, "a", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+
+def root_of(d):
+    """从作业目录反推使用方仓库根（d 是 <root>/.chatgpt/web-handoff）。"""
+    return d.parent.parent
+
+
+def load_job(d, job_id):
+    f = d / job_id / "job.json"
+    if not f.exists():
+        die("not_found", f"作业不存在：{job_id}")
+    return json.loads(f.read_text(encoding="utf-8"))
+
+
+def save_job(d, job):
+    job["updated_at"] = now()
+    f = d / job["id"] / "job.json"
+    f.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def all_jobs(d):
+    if not d.exists():
+        return []
+    out = []
+    for p in sorted(d.iterdir()):
+        f = p / "job.json"
+        if p.is_dir() and f.exists():
+            try:
+                out.append(json.loads(f.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def active_job(d):
+    for j in all_jobs(d):
+        if j.get("status") not in TERMINAL:
+            return j
+    return None
+
+
+def ensure_gitignored(root, d):
+    """契约 §1：request.md 含用户代码、result.md 含外部模型输出，两者都不该进使用方 git。"""
+    # 注：目录名 v0.5 起是 .chatgpt/web-handoff（原 .ai/handoffs）
+    rel = d.relative_to(root)
+    if not (root / ".git").exists():
+        return {"gitignored": None, "note": "使用方不是 git 仓库，跳过"}
+    # 探针必须是「作业目录下的文件」这个真实形状：只匹配目录的规则（如 `.ai/handoffs/*/`）
+    # 对裸文件路径不生效，用错形状会对已忽略的仓库重复追加 .gitignore。
+    probe = str(rel / "hf_probe" / "job.json")
+    r = subprocess.run(["git", "check-ignore", "-q", probe], cwd=root, capture_output=True)
+    if r.returncode == 0:
+        return {"gitignored": True}
+    gi = root / ".gitignore"
+    line = f"{rel}/"
+    prev = gi.read_text(encoding="utf-8") if gi.exists() else ""
+    sep = "" if (prev == "" or prev.endswith("\n")) else "\n"
+    gi.write_text(prev + sep + f"\n# ChatGPT handoff 作业产物（含代码上下文与外部模型输出）\n{line}\n",
+                  encoding="utf-8")
+    return {"gitignored": True, "note": f"已向 {gi} 追加 {line}"}
+
+
+def sha256(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def write_intent(jd, job_id, raw, action, effort):
+    """把用户原话冻结成不可变记录。
+
+    审查意见（hf_20260819_vr3t8c）指出的根因：只让 LLM 组织内容是对的，但不能顺带
+    让 LLM 决定「用户到底授权了什么任务」。原话必须原样落盘并带哈希，之后任何环节
+    都只能引用、不能改写。
+    """
+    intent = {
+        "job_id": job_id,
+        "created_at": now(),
+        "raw_instruction": raw,
+        "action": action,
+        "effort_requested": effort,
+        "instruction_sha256": sha256(raw),
+    }
+    (jd / "intent.json").write_text(
+        json.dumps(intent, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return intent
+
+
+def read_intent(jd):
+    f = jd / "intent.json"
+    if not f.exists():
+        return None
+    it = json.loads(f.read_text(encoding="utf-8"))
+    if sha256(it.get("raw_instruction", "")) != it.get("instruction_sha256"):
+        die("intent_tampered", "intent.json 的哈希对不上，用户原话被改过，拒绝提交",
+            file=str(f))
+    return it
+
+
+# ---------- 子命令 ----------
+
+def cmd_new(a):
+    if a.action not in ACTIONS:
+        die("bad_action", f"未知动作：{a.action}", allowed=sorted(ACTIONS))
+    tail = [x for x in (a.instruction or []) if x != "--"]
+    subject = (" ".join(tail).strip() or (a.subject or "").strip())
+    if len(subject) < 8:
+        die("no_subject", "必须给出审查对象（≥8 字）—— 用户原话，不要让模型自行推断要审什么",
+            hint='cgh new --action review -- 用 pro 模式审查 X 的 Y 决策是否成立')
+
+    # 档位三选一，优先级：用户原话 > --effort > 默认
+    spoken = effort_from_words(subject)
+    passed = EFFORT_ALIASES.get(a.effort, a.effort) if a.effort else None
+    if passed and passed not in EFFORTS:
+        die("bad_effort", f"未知档位：{a.effort}", allowed=sorted(EFFORTS),
+            aliases=sorted(EFFORT_ALIASES))
+
+    if spoken and passed and spoken != passed:
+        die("effort_mismatch",
+            f"用户原话说的是「{spoken}」，但 --effort 传的是「{passed}」",
+            spoken=spoken, passed=passed, subject=subject,
+            hint="以用户原话为准。要么改 --effort，要么确认是不是听错了——不要自己替用户改档位")
+
+    effort = spoken or passed or DEFAULT_EFFORT
+    effort_source = "用户原话" if spoken else ("显式参数" if passed else f"默认（{DEFAULT_EFFORT}）")
+
+    root = repo_root(a.root)
+    d = handoffs_dir(root)
+    with Lock(d):
+        busy = active_job(d)
+        if busy and not a.force:
+            die("busy", "已有活跃作业，V1.0 限制单作业并发",
+                active_id=busy["id"], active_status=busy["status"],
+                hint=f"cgh abort --id {busy['id']}")
+        gi = ensure_gitignored(root, d)
+        job_id = new_id()
+        jd = d / job_id
+        jd.mkdir(parents=True)
+        job = {
+            "id": job_id, "schema_version": SCHEMA_VERSION, "status": "created",
+            "action": a.action, "subject": subject,
+            "parent_id": None, "continue_from": None, "turns_before": None,
+            "effort_requested": effort, "effort_source": effort_source,
+            "effort_actual": None,
+            "effort_available": [], "model_actual": None,
+            "conversation_url": None, "page_id": None,
+            "stalled_count": 0,
+            "created_at": now(), "updated_at": now(),
+            "send_attempted_at": None, "submitted_at": None,
+            "completed_at": None, "poll_count": 0, "last_len": 0,
+            "result_file": None, "error": None, "notes": [],
+            "intent_sha256": sha256(subject), "request_sha256": None,
+            "origin": detect_origin(root), "outcome": None,
+        }
+        write_intent(jd, job_id, subject, a.action, effort)
+        save_job(d, job)
+        tpl = skill_dir() / "templates" / "handoff" / "request.md"
+        if not tpl.exists():
+            die("no_template", f"模板缺失：{tpl}")
+        (jd / "request.md").write_text(
+            tpl.read_text(encoding="utf-8")
+               .replace("{{JOB_ID}}", job_id)
+               .replace("{{SUBJECT}}", subject),
+            encoding="utf-8")
+    ledger_append("created", root, job)
+    ok(job_id=job_id, dir=str(jd), request=str(jd / "request.md"),
+       status="created", effort_requested=effort, effort_source=effort_source,
+       subject=subject, harness=job["origin"]["harness"], **gi)
+
+
+def cmd_continue(a):
+    """在既有 ChatGPT 对话里追问：建一个**子作业**，复用父作业的对话。
+
+    刻意不沿用 v0.3 的「同一个 job 里追加轮次」：那样 result.md 每轮被覆盖，
+    第一轮的裁决就丢了。子作业各有各的 job_id / request.md / result.md / 哨兵，
+    用 parent_id 串成链，整条对话每一轮都留得下。
+    """
+    root = repo_root(a.root)
+    d = handoffs_dir(root)
+    parent = load_job(d, a.parent)
+    if not parent.get("conversation_url"):
+        die("no_conversation", f"父作业 {a.parent} 还没有对话 URL，续聊无从谈起",
+            parent_status=parent["status"])
+
+    tail = [x for x in (a.instruction or []) if x != "--"]
+    subject = " ".join(tail).strip()
+    if len(subject) < 4:
+        die("no_subject", "追问内容不能为空 —— 原样照抄用户的话",
+            hint=f'cgh continue --from {a.parent} -- 你说的第 3 点能展开讲讲吗')
+
+    # 档位默认继承父作业；用户原话里点了档位则以原话为准
+    spoken = effort_from_words(subject)
+    passed = EFFORT_ALIASES.get(a.effort, a.effort) if a.effort else None
+    if spoken and passed and spoken != passed:
+        die("effort_mismatch", f"用户原话说的是「{spoken}」，但 --effort 传的是「{passed}」",
+            spoken=spoken, passed=passed)
+    effort = spoken or passed or parent["effort_requested"]
+    effort_source = "用户原话" if spoken else ("显式参数" if passed else f"继承父作业（{effort}）")
+
+    with Lock(d):
+        busy = active_job(d)
+        if busy and not a.force:
+            die("busy", "已有活跃作业，V1.0 限制单作业并发",
+                active_id=busy["id"], active_status=busy["status"],
+                hint=f"cgh abort --id {busy['id']}")
+        gi = ensure_gitignored(root, d)
+        job_id = new_id()
+        jd = d / job_id
+        jd.mkdir(parents=True)
+        job = {
+            "id": job_id, "schema_version": SCHEMA_VERSION, "status": "created",
+            "action": parent["action"], "subject": subject,
+            "parent_id": parent["id"], "continue_from": parent["conversation_url"],
+            "turns_before": None,
+            "effort_requested": effort, "effort_source": effort_source,
+            "effort_actual": None,
+            "effort_available": [], "model_actual": None,
+            "conversation_url": None, "page_id": parent.get("page_id"),
+            "stalled_count": 0,
+            "created_at": now(), "updated_at": now(),
+            "send_attempted_at": None, "submitted_at": None,
+            "completed_at": None, "poll_count": 0, "last_len": 0,
+            "result_file": None, "error": None, "notes": [],
+            "intent_sha256": sha256(subject), "request_sha256": None,
+            "origin": detect_origin(root), "outcome": None,
+        }
+        write_intent(jd, job_id, subject, parent["action"], effort)
+        save_job(d, job)
+        tpl = skill_dir() / "templates" / "handoff" / "followup.md"
+        if not tpl.exists():
+            die("no_template", f"模板缺失：{tpl}")
+        (jd / "request.md").write_text(
+            tpl.read_text(encoding="utf-8")
+               .replace("{{JOB_ID}}", job_id).replace("{{SUBJECT}}", subject),
+            encoding="utf-8")
+    ledger_append("created", root, job)
+    ok(job_id=job_id, dir=str(jd), request=str(jd / "request.md"), status="created",
+       parent_id=parent["id"], continue_from=parent["conversation_url"],
+       effort_requested=effort, effort_source=effort_source, subject=subject, **gi)
+
+
+def cmd_state(a):
+    d = handoffs_dir(repo_root(a.root))
+    job = load_job(d, a.id) if a.id else active_job(d)
+    if not job:
+        print("CGH_STATE active=none")
+        return
+    print("CGH_STATE id={id} status={status} action={action} "
+          "effort={eff_req}/{eff_act} poll={poll} url={url}".format(
+              id=job["id"], status=job["status"], action=job["action"],
+              eff_req=job["effort_requested"], eff_act=job.get("effort_actual") or "-",
+              poll=job.get("poll_count", 0), url=job.get("conversation_url") or "-"))
+    if job.get("error"):
+        print("CGH_ERROR " + json.dumps(job["error"], ensure_ascii=False))
+    if job.get("result_file"):
+        print("CGH_RESULT_FILE " + str(d / job["id"] / job["result_file"]))
+
+
+def _coerce(key, val):
+    if key in ("poll_count", "last_len"):
+        return int(val)
+    if key == "effort_available":
+        return [x for x in val.split("|") if x]
+    return val
+
+
+def cmd_update(a):
+    d = handoffs_dir(repo_root(a.root))
+    with Lock(d):
+        job = load_job(d, a.id)
+        changes = {}
+        for pair in a.set:
+            if "=" not in pair:
+                die("bad_set", f"--set 需要 k=v 形式：{pair}")
+            k, v = pair.split("=", 1)
+            if k not in job:
+                die("bad_field", f"job.json 无此字段：{k}", allowed=sorted(job))
+            changes[k] = _coerce(k, v)
+
+        new_status = changes.get("status")
+        if new_status:
+            cur = job["status"]
+            if new_status not in ALL_STATES:
+                die("bad_status", f"未知状态：{new_status}", allowed=sorted(ALL_STATES))
+            legal = FORWARD.get(cur, set()) | ERROR_TERMINAL | BLOCKED
+            if cur in TERMINAL and not a.force:
+                die("terminal", f"作业已是终态 {cur}，拒绝改为 {new_status}（需 --force）")
+            if new_status not in legal and not a.force:
+                die("bad_transition", f"非法状态迁移：{cur} → {new_status}",
+                    allowed=sorted(legal))
+            if new_status == "submitted" and not job.get("submitted_at"):
+                job["submitted_at"] = now()
+            if new_status in ("completed", "no_sentinel"):
+                job["completed_at"] = now()
+
+        job.update(changes)
+        if a.note:
+            job["notes"].append(f"{now()} {a.note}")
+        save_job(d, job)
+    ok(job_id=job["id"], status=job["status"], changed=sorted(changes))
+
+
+def parse_sentinel(text, job_id):
+    """契约 §8：取最后一处 CGH_RESULT_<id> ... CGH_END_<id>，只读不猜。"""
+    # 取「最后一个完整配对」：以最后一个 CGH_END 为准，向前找最近的 CGH_RESULT。
+    # 不能用一条 CGH_RESULT...CGH_END 的非贪婪正则——ChatGPT 输出被截断时会出现
+    # CGH_RESULT 两次、CGH_END 一次，那样会把两块连中间的散文一起吞进 body。
+    starts = [m.end() for m in
+              re.finditer(r"CGH_RESULT_" + re.escape(job_id) + r"[ \t]*\n", text)]
+    ends = [m.start() for m in
+            re.finditer(r"\n[ \t]*CGH_END_" + re.escape(job_id), text)]
+    if not starts:
+        return None, "未找到 CGH_RESULT 起始标记"
+    if not ends:
+        return None, "找到 CGH_RESULT 但没有 CGH_END，输出可能被截断"
+    end = ends[-1]
+    prior = [s for s in starts if s < end]
+    if not prior:
+        return None, "CGH_END 之前没有配对的 CGH_RESULT"
+    body = text[prior[-1]:end]
+
+    out, cur = {}, None
+    for raw in body.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        stripped = line.strip()
+        if stripped.startswith(("- ", "* ")) and cur:
+            out[cur].append(stripped[2:].strip())
+            continue
+        mm = re.match(r"^([a-z_]+)\s*:\s*(.*)$", stripped)
+        if not mm:
+            continue
+        key, val = mm.group(1), mm.group(2).strip()
+        if key in LIST_FIELDS:
+            out[key] = [val] if val else []
+            cur = key
+        else:
+            out[key] = val
+            cur = None
+
+    if out.get("verdict") not in VERDICTS:
+        return None, f"verdict 非法：{out.get('verdict')!r}（需 {sorted(VERDICTS)}）"
+    try:
+        c = float(out.get("confidence", ""))
+    except ValueError:
+        return None, f"confidence 不是数字：{out.get('confidence')!r}"
+    if not 0.0 <= c <= 1.0:
+        return None, f"confidence 越界：{c}"
+    if not out.get("summary"):
+        return None, "summary 为空"
+    out["confidence"] = c
+    for f in LIST_FIELDS:
+        out.setdefault(f, [])
+    return out, None
+
+
+def render_result(job, parsed, raw):
+    def bullets(items):
+        items = [i for i in items if i and i.lower() != "none"]
+        return "\n".join(f"- {i}" for i in items) if items else "- （无）"
+
+    return f"""# Handoff Result {job['id']}
+
+- 审查对象（用户原话）：{job.get('subject') or '-'}
+- request 哈希：{(job.get('request_sha256') or '-')[:16]}
+- 档位来源：{job.get('effort_source') or '-'}
+- 提交：{job.get('submitted_at') or '-'}  ·  完成：{job.get('completed_at') or '-'}  ·  档位：{job.get('effort_actual') or job['effort_requested']}
+- 对话：{job.get('conversation_url') or '-'}
+
+## 裁决
+
+| verdict | confidence |
+|---------|-----------|
+| {parsed['verdict']} | {parsed['confidence']:.2f} |
+
+**summary**：{parsed['summary']}
+
+## findings
+
+{bullets(parsed['findings'])}
+
+## recommended_actions
+
+{bullets(parsed['recommended_actions'])}
+
+## missing_information
+
+{bullets(parsed['missing_information'])}
+
+---
+
+## 原始输出（未改写）
+
+{raw.strip()}
+"""
+
+
+def cmd_parse(a):
+    d = handoffs_dir(repo_root(a.root))
+    src = Path(a.source)
+    if not src.exists():
+        die("no_source", f"原文文件不存在：{src}")
+    raw = src.read_text(encoding="utf-8")
+
+    with Lock(d):
+        job = load_job(d, a.id)
+        jd = d / job["id"]
+        parsed, err = _store_parse(d, job, raw)
+    if err:
+        ledger_append("no_sentinel", root_of(d), load_job(d, job["id"]))
+        die("no_sentinel", err, job_id=job["id"], status="no_sentinel",
+            raw=str(jd / "raw-last-message.txt"),
+            hint="原文已保留，交人判断；不要让模型补写缺失字段")
+    ok(job_id=job["id"], status="completed", result=str(jd / "result.md"),
+       verdict=parsed["verdict"], confidence=parsed["confidence"],
+       summary=parsed["summary"], findings=len(parsed["findings"]),
+       recommended_actions=len(parsed["recommended_actions"]))
+
+
+def _store_parse(d, job, raw):
+    """写 raw-last-message.txt + 解析哨兵 + 落 result.md。调用方须持锁。"""
+    jd = d / job["id"]
+    (jd / "raw-last-message.txt").write_text(raw, encoding="utf-8")
+    parsed, err = parse_sentinel(raw, job["id"])
+    if err:
+        job["status"] = "no_sentinel"
+        job["completed_at"] = now()
+        job["error"] = {"code": "no_sentinel", "message": err, "at": now()}
+    else:
+        job["status"] = "completed"
+        job["completed_at"] = now()
+        job["result_file"] = "result.md"
+        job["error"] = None
+        (jd / "result.md").write_text(render_result(job, parsed, raw), encoding="utf-8")
+    save_job(d, job)
+    return parsed, err
+
+
+def _mark(d, job_id, status, code, msg, **extra):
+    with Lock(d):
+        job = load_job(d, job_id)
+        job["status"] = status
+        job["error"] = {"code": code, "message": msg, "at": now()}
+        job.update(extra)
+        job["notes"].append(f"{now()} {status}: {msg}")
+        save_job(d, job)
+    # 失败也要进账本。只记成功的话，统计出来的全是幸存者偏差。
+    ledger_append("failed", root_of(d), job, status=status, code=code)
+    die(code, msg, job_id=job_id, status=status, **extra)
+
+
+def _classify(exc):
+    """把 CDP 异常归到契约里的状态，而不是一律 failed。"""
+    m = str(exc)
+    if "白名单" in m:
+        return "wrong_page", "wrong_page"
+    if "未登录" in m or "登录页" in m:
+        return "auth_required", "auth_required"
+    if "连不上" in m:
+        return "remote_debug_denied", "remote_debug_denied"
+    if "解冻失败" in m:
+        return "ui_changed", "background_unfreeze_failed"
+    if "附件" in m:
+        # 不是 ChatGPT 改版。要么页面脏（有别人的遗留附件），要么注入形态没落到
+        # inline/attachment 任一条。归到 ui_changed 会把人引去查一个不存在的改版。
+        return "failed", "attachment_state"
+    if m.startswith("定位失败") or "等待超时" in m or "对不上" in m:
+        return "ui_changed", "ui_changed"
+    return "failed", "cdp_error"
+
+
+def _unfilled_placeholders(request_text):
+    # 先剔掉围栏代码块再查：往 review 请求里贴代码是本工具的主用途，
+    # 而代码里到处是花括号和尖括号，不剔就会把正常的源码判成"没填模板"。
+    body = re.sub(r"```.*?```", "", request_text, flags=re.S)
+    tpl = (skill_dir() / "templates" / "handoff" / "request.md").read_text(encoding="utf-8")
+    holes = [ln.strip() for ln in tpl.splitlines()
+             if ln.strip().startswith("<") and ln.strip().endswith(">")]
+    return [h for h in holes if h in body] + (["{{...}}"] if "{{" in body else [])
+
+
+def _format_tail(job_id, body):
+    """从正文里抠出输出要求那一段，供「正文转附件」时另行内联。
+
+    抠不出来就退回一句通用指令——宁可简略，也不能让格式要求整段沉进附件。
+    """
+    # 取**最后**一处，跟 cgh parse 的规则保持一致：正文里可能引用了早先的哨兵示例
+    ms = re.findall(rf"(```+\s*\n?CGH_RESULT_{re.escape(job_id)}.*?CGH_END_{re.escape(job_id)}\s*\n?```+)",
+                    body, re.S)
+    block = ms[-1] if ms else None
+    head = "附件是完整的交接正文，请通读后作答。"
+    if not block:
+        return head + f"回答最后请用 fenced code block 原样输出 CGH_RESULT_{job_id} … CGH_END_{job_id} 结构化块。"
+    return head + "回答的最后，请用一个 fenced code block 原样输出下面这段，字段名与顺序不要改：\n\n" + block
+
+
+def cmd_submit(a):
+    import cgh_cdp as cdp
+    import cgh_web as web
+
+    d = handoffs_dir(repo_root(a.root))
+    job = load_job(d, a.id)
+    jd = d / job["id"]
+    if job["status"] in TERMINAL:
+        die("terminal", f"作业已是终态：{job['status']}")
+    if job.get("conversation_url") and not a.force:
+        die("already_submitted", f"该作业已提交：{job['conversation_url']}（需 --force）")
+    # send 闸门只认 --force-resend。--force 用来放行「占位符没填完」这类内容问题，
+    # 不该顺带把「可能已经发出去了」这条安全 invariant 一起掀掉。
+    if job.get("send_attempted_at") and not a.force_resend:
+        die("send_unknown", "上次已经跨过发送边界，重跑会产生重复 handoff",
+            send_attempted_at=job["send_attempted_at"], page_id=job.get("page_id"),
+            conversation_url=job.get("conversation_url"),
+            hint=f"真发出去了：cgh confirm --id {job['id']} --url <对话URL>；"
+                 f"确认没发出去：cgh submit --id {job['id']} --force-resend")
+
+    req = jd / "request.md"
+    if not req.exists():
+        die("no_request", f"request.md 不存在：{req}")
+    intent = read_intent(jd)
+    if intent and intent["raw_instruction"] not in (job.get("subject") or ""):
+        die("intent_mismatch", "job.json 的 subject 与 intent.json 的用户原话不一致，拒绝提交",
+            intent=intent["raw_instruction"], subject=job.get("subject"))
+    body = req.read_text(encoding="utf-8")
+    if intent and intent["raw_instruction"] not in body:
+        die("instruction_absent", "request.md 里找不到用户原话，说明正文写跑题了，拒绝提交",
+            instruction=intent["raw_instruction"],
+            hint="request.md 的「目标」节必须原样包含用户那句话")
+    holes = _unfilled_placeholders(body)
+    if holes and not a.force:
+        die("request_unfilled", "request.md 还有未填写的模板占位符，先补完再提交",
+            placeholders=holes[:6], request=str(req))
+
+    page = target_id = None
+    try:
+        continuing = bool(job.get("continue_from"))
+        if continuing:
+            # 续聊：复用父作业那个对话。attach_or_open 先按 page_id 认标签页，
+            # 被关掉了就按 conversation_url 重开——正是"tab 还活着就接着聊"。
+            page, target_id, reopened = web.attach_or_open(
+                job.get("page_id"), job["continue_from"])
+        else:
+            owned = {j.get("page_id") for j in all_jobs(d) if j.get("page_id")}
+            page, target_id = web.open_new_chat(owned_ids=owned)
+        web.guard_host(page)
+        turns_before = web.count_assistant(page) if continuing else 0
+        # 正文超长时 ChatGPT 会转成附件，格式要求会跟着沉进去。
+        # 把哨兵那一段单独内联，保证输出格式指令 ChatGPT 一定看得见。
+        injected = web.inject(page, body, tail=_format_tail(job["id"], body))
+
+        # ── 临界区：设档位 → 复验 → 发送。全机互斥，但只占一两秒 ──
+        # 推理强度是账号级偏好、跨标签页实时同步，别的 harness 同时提交会把它改掉。
+        # 生成阶段不在锁内，所以并发能力不受影响。
+        with BrowserLock():
+            eff = web.configure(page, job["effort_requested"])
+            with Lock(d):
+                job = load_job(d, a.id)
+                job["effort_actual"] = eff["effort_actual"]
+                job["effort_available"] = eff["available"]
+                job["model_actual"] = eff["model"]
+                job["page_id"] = target_id
+                save_job(d, job)
+
+            if eff["model"] and eff["model"] != web.EXPECTED_MODEL and not a.allow_model_drift:
+                page.close()
+                _mark(d, a.id, "model_changed", "model_changed",
+                      f"模型不是钉死的 {web.EXPECTED_MODEL}，实测是 {eff['model']}",
+                      hint="确认无误就改 bin/cgh_web.py 的 EXPECTED_MODEL；只想这次放行用 --allow-model-drift")
+
+            # 发送前最后一眼：确认档位没被别人改走。此刻还没跨发送边界，中止是安全的。
+            web.guard_host(page)
+            settled = web.read_effort(page)
+            if settled not in web._labels(job["effort_requested"]):
+                page.close()
+                # 这里刻意**不置终态**：还没跨发送边界，什么都没发出去，作业是干净的。
+                # 置成 effort_not_found（终态）会让「重跑一次」变成必须 --force，
+                # 而这只是两个 harness 撞在同一秒上的瞬时冲突。
+                die("effort_drifted",
+                    f"发送前复验：档位被改成 {settled}，要的是 {web._labels(job['effort_requested'])[0]}",
+                    job_id=a.id, effort_available=eff["available"],
+                    hint="多半是另一个 harness 同时在提交。直接重跑 submit 即可——"
+                         "本次未发送、不消耗额度、作业状态未变")
+
+            # 原子 check-and-set：入口那次检查在锁外，两个并发 submit 能同时通过。
+            # 真正的闸门必须在同一把锁里「重读 → 复检 → 打戳」，缺一环就还是有并发窗口。
+            with Lock(d):
+                fresh = load_job(d, a.id)
+                if fresh.get("send_attempted_at") and not a.force_resend:
+                    page.close()
+                    die("send_unknown", "另一个 submit 已经跨过发送边界，本次退出以免重复发送",
+                        job_id=a.id, send_attempted_at=fresh["send_attempted_at"])
+                fresh["send_attempted_at"] = now()
+                if continuing:
+                    # 记下发送前的助手消息数：poll 要靠它区分「新回合」与「上一轮的旧回答」
+                    fresh["turns_before"] = turns_before
+                save_job(d, fresh)          # 先落盘再按发送：崩在中间也留得下痕迹
+
+            # 从这里往下就是非幂等区。click 派发到一半断连、URL 等超时、甚至事后本地写盘失败，
+            # 都不能证明「没发出去」——一律按不确定处理，绝不自动重投。
+            try:
+                web.send(page)
+                if continuing:
+                    # 续聊时 URL 不变，wait_conversation_url 会立刻返回、等于没验。
+                    # 改看真实证据：新回合出现（助手消息数增加或停止按钮亮起）。
+                    web.wait_new_turn(page, turns_before)
+                    url = job["continue_from"]
+                else:
+                    url = web.wait_conversation_url(page)
+            except Exception as e:
+                page.close()
+                _mark(d, a.id, "send_unknown", "send_unknown",
+                      f"跨过发送边界后结果不确定：{e}",
+                      hint=f"去浏览器看那个标签页；真发出去了 cgh confirm --id {a.id} --url <对话URL>")
+    except web.EffortNotFound as e:
+        if page:
+            page.close()
+        _mark(d, a.id, "effort_not_found",
+              "effort_not_found", str(e), effort_available=e.available)
+    except web.WrongPage as e:
+        if page:
+            page.close()
+        _mark(d, a.id, "wrong_page", "wrong_page", str(e))
+    except cdp.CdpError as e:
+        if page:
+            try:
+                (jd / "failed-page.txt").write_text(
+                    json.dumps(web.read_progress(page), ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+            except cdp.CdpError:
+                pass
+            page.close()
+        status, code = _classify(e)
+        _mark(d, a.id, status, code, str(e))
+
+    with Lock(d):
+        job = load_job(d, a.id)
+        job["status"] = "submitted"
+        job["submitted_at"] = now()
+        job["request_sha256"] = sha256(body)      # 冻结提交出去的那一版正文
+        job["injected_as"] = injected.get("mode")
+        # 只是"投进去多少字"，不等于"附件里验证到多少字"——别在事后审计时误当成完整性已验证
+        job["requested_chars"] = injected.get("requested_chars")
+        job["conversation_url"] = url
+        job["error"] = None
+        save_job(d, job)
+    page.close()
+    ledger_append("submitted", root_of(d), job, injected_as=injected.get("mode"),
+                  requested_chars=injected.get("requested_chars"))
+    ok(job_id=job["id"], status="submitted", conversation_url=url,
+       effort_requested=job["effort_requested"], effort_actual=job["effort_actual"],
+       effort_touched=eff["touched"], model_actual=eff["model"],
+       injected_chars=injected["len"], injected_as=injected.get("mode"),
+       requested_chars=injected.get("requested_chars"), page_id=target_id,
+       hint=f"稍后 cgh poll --id {job['id']}")
+
+
+def cmd_confirm(a):
+    """人工确认「那一发确实发出去了」，补上 URL 并推进到 submitted。
+
+    比让用户手搓 `cgh update` 好：这里知道该同时补哪几个字段、该做哪些校验。
+    """
+    d = handoffs_dir(repo_root(a.root))
+    with Lock(d):
+        job = load_job(d, a.id)
+        if not job.get("send_attempted_at") and not a.force:
+            die("not_sent", "这个作业没有跨过发送边界，没什么可确认的",
+                status=job["status"])
+        url = a.url.strip()
+        if not re.match(r"^https://(chatgpt\.com|chat\.openai\.com)/c/[^/]+$", url):
+            die("bad_url", "对话 URL 形如 https://chatgpt.com/c/<id>", got=url)
+        if "/c/WEB:" in url:
+            die("bad_url", "这是客户端临时 id，事后打不开。在浏览器里等它变成真 id 再抄",
+                got=url)
+        job["conversation_url"] = url
+        job["status"] = "submitted"
+        job["submitted_at"] = job.get("submitted_at") or now()
+        job["error"] = None
+        job["notes"].append(f"{now()} 人工确认发送成功：{url}")
+        save_job(d, job)
+    ledger_append("submitted", root_of(d), job, confirmed_by_human=True)
+    ok(job_id=job["id"], status="submitted", conversation_url=url,
+       hint=f"cgh poll --id {job['id']}")
+
+
+def _poll_once(d, job_id, hold=None):
+    """读一次生成状态。返回 (done: bool, payload: dict)。
+
+    poll 与 wait 共用这一段——判完成的逻辑只能有一份，抄第二份迟早两边走岔。
+    终态错误直接 die（wait 循环也应当就此停下）。
+
+    hold 是 `cgh wait` 传进来的 session 持有者（一个可变 dict）。
+    **CDP 一断开，解冻的两个 override 立刻被 Chrome 收回**（实测：断 20s 后重连，
+    未解冻时读到 hidden/False/False）。所以每跳都 attach-读-close 的话，
+    15s 间隔里有 14 秒页面是冻着的，DOM 只在 poll 那一瞬间补更新。
+    wait 因此全程复用同一个连接；单发的 `cgh poll` 做不到，只能每次重新施加。
+    """
+    import cgh_cdp as cdp
+    import cgh_web as web
+
+    job = load_job(d, job_id)
+    if job["status"] in TERMINAL:
+        jd = d / job["id"]
+        return True, dict(job_id=job["id"], status=job["status"], terminal=True,
+                          result=str(jd / job["result_file"]) if job.get("result_file") else None)
+
+    def _release(p):
+        """wait 持有连接时不能关——一关 override 就没了。"""
+        if hold is None:
+            p.close()
+
+    page = None
+    try:
+        if hold is not None and hold.get("page") is not None:
+            page = hold["page"]
+            try:
+                page.evaluate("1")            # 连接还活着吗（标签页可能被人关了）
+            except Exception:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                page = hold["page"] = None
+            else:
+                web.guard_host(page)          # 活着就照常校验白名单，人可能把这页导航走了
+        if page is None:
+            page, tid, opened = web.attach_or_open(job.get("page_id"), job.get("conversation_url"))
+            if hold is not None:
+                hold["page"] = page
+            if opened:
+                # 原标签页被关了，这里重开了一个。记下来，免得每次 poll 都新开一页越堆越多。
+                with Lock(d):
+                    j = load_job(d, job["id"])
+                    j["page_id"] = tid
+                    save_job(d, j)
+        prog = web.read_progress(page)
+        sentinel = f"CGH_END_{job['id']}" in prog["tail"]
+
+        # 续聊时最后一条助手消息一开始还是上一轮那条（已完成、且不含本轮哨兵）。
+        # 不排除掉它，连续两次读到同一条就会被判成「停了」，把上一轮的答案
+        # 当作本轮结果落成 no_sentinel 终态。
+        tb = job.get("turns_before")
+        new_turn = tb is None or prog.get("assistant_msgs", 0) > tb
+
+        # 页面结构还认得出来吗？认不出来就不能拿「没有停止按钮」当「生成完了」——
+        # ChatGPT 改个 testid，每次 poll 都会立刻看起来像"已完成"，静默给出半截结果。
+        if not prog.get("has_composer") and not prog.get("has_send_btn"):
+            page.close()
+            _mark(d, job["id"], "ui_changed", "ui_changed",
+                  "页面上找不到 composer 与发送按钮，无法判断生成状态（疑似 ChatGPT 改版）",
+                  hint=f"人工看一眼 {job.get('conversation_url')}")
+
+        # 「长度不变」只算一次微弱证据。连续两次都不变才承认它停了——
+        # 单次相同区分不了「真结束」和「渲染临时停顿」，而 no_sentinel 是终态、误判就废掉这个作业。
+        stalled_now = prog["len"] > 0 and prog["len"] == job.get("last_len", 0)
+        stalled = stalled_now and job.get("stalled_count", 0) >= 1
+
+        if prog["generating"] or not new_turn or (not sentinel and not stalled):
+            with Lock(d):
+                job = load_job(d, job["id"])
+                job["status"] = "generating"
+                job["poll_count"] = job.get("poll_count", 0) + 1
+                job["stalled_count"] = (job.get("stalled_count", 0) + 1) if stalled_now else 0
+                job["last_len"] = prog["len"]
+                save_job(d, job)
+            _release(page)
+            return False, dict(job_id=job["id"], status="generating", chars=prog["len"],
+                               poll_count=job["poll_count"], generating=prog["generating"],
+                               stalled_count=job["stalled_count"])
+
+        raw = web.read_full(page)
+        page.close()
+    except cdp.CdpError as e:
+        if page:
+            page.close()
+        status, code = _classify(e)
+        _mark(d, job["id"], status, code, str(e))
+
+    with Lock(d):
+        job = load_job(d, job["id"])
+        job["poll_count"] = job.get("poll_count", 0) + 1
+        job["last_len"] = len(raw)
+        parsed, err = _store_parse(d, job, raw)
+    jd = d / job["id"]
+    if err:
+        ledger_append("no_sentinel", root_of(d), load_job(d, job["id"]))
+        die("no_sentinel", err, job_id=job["id"], status="no_sentinel",
+            raw=str(jd / "raw-last-message.txt"),
+            hint="原文已保留，交人判断；不要让模型补写缺失字段")
+    ledger_append("completed", root_of(d), load_job(d, job["id"]),
+                  verdict=parsed["verdict"], confidence=parsed["confidence"],
+                  findings=len(parsed["findings"]),
+                  recommended_actions=len(parsed["recommended_actions"]),
+                  poll_count=job.get("poll_count"))
+    return True, dict(job_id=job["id"], status="completed", result=str(jd / "result.md"),
+                      verdict=parsed["verdict"], confidence=parsed["confidence"],
+                      summary=parsed["summary"], findings=len(parsed["findings"]),
+                      recommended_actions=len(parsed["recommended_actions"]))
+
+
+def cmd_poll(a):
+    d = handoffs_dir(repo_root(a.root))
+    job = load_job(d, a.id) if a.id else active_job(d)
+    if not job:
+        die("no_active", "没有活跃作业")
+    done, payload = _poll_once(d, job["id"])
+    if not done:
+        payload["hint"] = "尚未完成；想让它自己等就用 cgh wait"
+    ok(**payload)
+
+
+def cmd_wait(a):
+    """阻塞轮询到出结果为止——省掉「每隔几分钟人工说一声 poll」。
+
+    submit 与 wait 都可以由 AI 自己发起（v0.5.1 起放开）。发送要花用户的档位额度，
+    所以判断力还是要有；但「等结果」这件事从来不需要人盯着。
+    进度打到 stderr，最终 JSON 打到 stdout，方便调用方只取最后一行。
+    """
+    d = handoffs_dir(repo_root(a.root))
+    job = load_job(d, a.id) if a.id else active_job(d)
+    if not job:
+        die("no_active", "没有活跃作业")
+
+    deadline = time.time() + a.timeout
+    tick = 0
+    hold = {"page": None}          # 全程复用一个 CDP 连接，断了页面就被重新冻上
+    while True:
+        done, payload = _poll_once(d, job["id"], hold)
+        if done:
+            ok(**payload)
+            return
+        tick += 1
+        left = deadline - time.time()
+        if left <= 0:
+            ok(job_id=job["id"], status="generating", timed_out=True,
+               waited_seconds=a.timeout, chars=payload.get("chars"),
+               conversation_url=load_job(d, job["id"]).get("conversation_url"),
+               hint="超时了但作业还活着，不是失败。再跑一次 cgh wait 接着等")
+            return
+        print(f"[{tick}] generating chars={payload.get('chars')} 还剩 {int(left)}s",
+              file=sys.stderr, flush=True)
+        time.sleep(min(a.interval, max(1, left)))
+
+
+def cmd_doctor(a):
+    """开工前自检：9222 通不通、ChatGPT 登没登、编排层能不能跑。"""
+    import cgh_cdp as cdp
+    import cgh_web as web
+
+    report = {}
+    try:
+        report["browser"] = cdp.browser_version().get("Browser")
+    except cdp.CdpError as e:
+        die("remote_debug_denied", str(e),
+            hint='open -a "Google Chrome" --args --remote-debugging-port=9222（先问用户，不要擅自重启）')
+    pages = cdp.list_pages()
+    report["pages"] = len(pages)
+    report["chatgpt_tabs"] = sum(1 for p in pages
+                                 if any(h in p.get("url", "") for h in web.CHATGPT_HOSTS))
+    if a.deep:
+        page, tid = web.open_new_chat()
+        try:
+            report["host"] = web.guard_host(page)
+            report["logged_in"] = web.check_login(page)
+            report["effort_now"] = web.read_effort(page)
+        finally:
+            page.close()      # 标签页留着，不关
+    d = handoffs_dir(repo_root(a.root))
+    act = active_job(d)
+    report["active_job"] = act["id"] if act else None
+    ok(**report)
+
+
+OUTCOMES = {"adopted": "采纳", "partial": "部分采纳", "rejected": "驳回"}
+
+
+def cmd_outcome(a):
+    """记下这条结论的下场——这是整套留痕里唯一能让 skill 进化的信号。
+
+    没有这一步，账本只知道「ChatGPT 说了什么」，永远不知道「它说得对不对」。
+    该由动手改代码的人/AI 来填：只有他知道哪条建议真被用了、哪条照做反而是坑。
+    """
+    if a.status not in OUTCOMES:
+        die("bad_outcome", f"未知结论：{a.status}", allowed=sorted(OUTCOMES))
+    d = handoffs_dir(repo_root(a.root))
+    job = load_job(d, a.id)
+    if not job.get("result_file") and job["status"] != "no_sentinel":
+        die("no_result", f"作业 {a.id} 还没有结果（status={job['status']}），无从评判",
+            hint="等 cgh wait 出结果再来记")
+    prev = job.get("outcome")
+    with Lock(d):
+        job = load_job(d, a.id)
+        job["outcome"] = {"status": a.status, "note": a.note,
+                          "commit": a.commit, "at": now()}
+        job["notes"].append(f"{now()} outcome={a.status}"
+                            + (f"（原为 {prev['status']}）" if prev else ""))
+        save_job(d, job)
+    ledger_append("outcome", root_of(d), job, outcome=a.status,
+                  outcome_note=a.note, outcome_commit=a.commit)
+    ok(job_id=a.id, outcome=a.status, outcome_cn=OUTCOMES[a.status],
+       commit=a.commit, note=a.note,
+       revised_from=prev["status"] if prev else None)
+
+
+# ---------------------------------------------------------------- 统计
+
+def _w(t):
+    """中日韩字符占两列，不算的话框线必歪。"""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(t))
+
+
+def _table(title, headers, rows):
+    if not rows:
+        return
+    cols = [max(_w(headers[i]), *(_w(r[i]) for r in rows)) for i in range(len(headers))]
+    def line(l, m, r):
+        return l + m.join("─" * (c + 2) for c in cols) + r
+    def row(cells):
+        return "│ " + " │ ".join(str(c) + " " * (cols[i] - _w(c))
+                                 for i, c in enumerate(cells)) + " │"
+    print(f"\n{title}")
+    print(line("┌", "┬", "┐")); print(row(headers)); print(line("├", "┼", "┤"))
+    for r in rows:
+        print(row(r))
+    print(line("└", "┴", "┘"))
+
+
+def _short(path):
+    """账本里存绝对路径（可回溯），显示时收窄，否则表格全被一列撑爆。"""
+    t = str(path).replace(str(Path.home()), "~")
+    parts = t.split("/")
+    return t if len(parts) <= 4 else ".../" + "/".join(parts[-2:])
+
+
+def _read_ledger():
+    if not LEDGER.exists():
+        return []
+    out = []
+    for ln in LEDGER.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            out.append(json.loads(ln))
+        except Exception:
+            pass          # 坏行跳过，账本是 append-only，不为一行坏数据丢全部
+    return out
+
+
+def _by_job(recs):
+    """账本是事件流，统计要的是作业维度，先按 id 折叠。"""
+    jobs = {}
+    for r in recs:
+        j = jobs.setdefault(r.get("id"), {"evs": {}})
+        j["evs"][r.get("ev")] = r
+        for k in ("repo", "harness", "action", "subject", "parent_id",
+                  "effort_requested", "effort_actual", "conversation_url"):
+            if r.get(k) is not None:
+                j[k] = r[k]
+    return jobs
+
+
+def _count(pairs):
+    c = {}
+    for k in pairs:
+        c[k] = c.get(k, 0) + 1
+    return c
+
+
+def cmd_stats(a):
+    jobs = _by_job(_read_ledger())
+    if not jobs:
+        die("empty_ledger", f"账本还是空的：{LEDGER}",
+            hint="跑过 cgh new 之后才会有记录")
+    if a.json:
+        ok(ledger=str(LEDGER), jobs=len(jobs), detail=jobs)
+
+    done = {i: j for i, j in jobs.items() if "completed" in j["evs"]}
+    print(f"账本 {LEDGER}    作业 {len(jobs)} 个，出结果 {len(done)} 个")
+
+    _table("按仓库", ["仓库", "作业", "完成"],
+           [[_short(r), str(n), str(sum(1 for i, j in done.items() if j.get("repo") == r))]
+            for r, n in sorted(_count(j.get("repo", "?") for j in jobs.values()).items(),
+                               key=lambda kv: -kv[1])])
+
+    _table("按发起方", ["harness", "作业"],
+           [[h or "unknown", str(n)] for h, n in
+            sorted(_count(j.get("harness") for j in jobs.values()).items(),
+                   key=lambda kv: -kv[1])])
+
+    # 只按 effort_requested 归组：effort_actual 是 UI 上的中文标签（高/极速/Pro），
+    # 跟规范值（high/instant/pro）混在一列会把同一个档位劈成两行。
+    rows = []
+    for eff, n in sorted(_count(j.get("effort_requested") for j in jobs.values()).items(),
+                         key=lambda kv: -kv[1]):
+        sub = [j for j in done.values() if j.get("effort_requested") == eff]
+        confs = [j["evs"]["completed"].get("confidence") for j in sub]
+        confs = [c for c in confs if isinstance(c, (int, float))]
+        verd = _count(j["evs"]["completed"].get("verdict") for j in sub)
+        labels = sorted({str(j.get("effort_actual")) for j in jobs.values()
+                         if j.get("effort_requested") == eff and j.get("effort_actual")})
+        rows.append([str(eff), "/".join(labels) or "-", str(n), str(len(sub)),
+                     f"{sum(confs)/len(confs):.2f}" if confs else "-",
+                     " ".join(f"{k}:{v}" for k, v in sorted(verd.items()) if k) or "-"])
+    _table("按档位（性价比看这张）",
+           ["档位", "UI 实测", "作业", "完成", "平均置信", "裁决分布"], rows)
+
+    _table("按动作", ["action", "作业"],
+           [[str(k), str(v)] for k, v in
+            sorted(_count(j.get("action") for j in jobs.values()).items(),
+                   key=lambda kv: -kv[1])])
+
+    oc = {i: j["evs"]["outcome"] for i, j in jobs.items() if "outcome" in j["evs"]}
+    if oc:
+        _table("结论的下场（进化燃料）", ["处置", "条数"],
+               [[OUTCOMES.get(k, str(k)), str(v)] for k, v in
+                sorted(_count(r.get("outcome") for r in oc.values()).items(),
+                       key=lambda kv: -kv[1])])
+    unjudged = len(done) - len(oc)
+    if unjudged > 0:
+        print(f"\n⚠️  {unjudged} 个作业出了结果但没记下场——"
+              f"这部分对进化是浪费的（cgh outcome --id <id> --status ...）")
+
+
+def cmd_backfill(a):
+    """把已有作业补进账本。幂等：账本里已有的 id 跳过。
+
+    不补的话 L3 要攒几个月才有统计价值，而历史作业本身就是最好的样本。
+    补出来的记录只有 created/completed 两类事件，时间戳取 job.json 里的原值。
+    """
+    d = handoffs_dir(repo_root(a.root))
+    known = {r.get("id") for r in _read_ledger()}
+    added, skipped = [], 0
+    for f in sorted(d.glob("*/job.json")):
+        job = json.loads(f.read_text(encoding="utf-8"))
+        if job["id"] in known:
+            skipped += 1
+            continue
+        job.setdefault("origin", {"harness": "backfill"})
+        ledger_append("created", root_of(d), job, ts_override=job.get("created_at"))
+        rf = f.parent / (job.get("result_file") or "")
+        if job.get("completed_at") and rf.exists():
+            v = _verdict_of(rf)
+            ledger_append("completed", root_of(d), job, ts_override=job["completed_at"], **v)
+        added.append(job["id"])
+    ok(backfilled=len(added), skipped=skipped, ledger=str(LEDGER), ids=added)
+
+
+def _verdict_of(result_file):
+    """从已生成的 result.md 里抠出裁决，供回填用。"""
+    out = {}
+    try:
+        for ln in result_file.read_text(encoding="utf-8").splitlines():
+            for k, cast in (("verdict", str), ("confidence", float)):
+                if ln.startswith(f"{k}:") and k not in out:
+                    try:
+                        out[k] = cast(ln.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return out
+
+
+def cmd_list(a):
+    d = handoffs_dir(repo_root(a.root))
+    jobs = all_jobs(d)
+    if not jobs:
+        print("（无作业）")
+        return
+    print(f"{'JOB_ID':<22} {'STATUS':<18} {'EFFORT':<10} {'ACTION':<8} CREATED")
+    for j in jobs:
+        print("{:<22} {:<18} {:<10} {:<8} {}".format(
+            j["id"], j.get("status", "?"),
+            j.get("effort_actual") or j.get("effort_requested", "?"),
+            j.get("action", "?"), (j.get("created_at") or "")[:19]))
+        # 对话 URL 是回溯这次交接的唯一入口，别只留在 job.json 里
+        if j.get("subject"):
+            print(f"  ↳ 审查对象：{j['subject']}")
+        print(f"  ↳ 对话：{j.get('conversation_url') or '（未提交）'}")
+    act = active_job(d)
+    print(f"\n活跃作业：{act['id'] if act else '无'}")
+
+
+def cmd_abort(a):
+    d = handoffs_dir(repo_root(a.root))
+    with Lock(d):
+        job = load_job(d, a.id)
+        if job["status"] in TERMINAL:
+            die("terminal", f"作业已是终态：{job['status']}")
+        job["status"] = "failed"
+        job["error"] = {"code": "aborted", "message": a.reason or "人工中止", "at": now()}
+        job["notes"].append(f"{now()} aborted: {a.reason or '人工中止'}")
+        save_job(d, job)
+    ok(job_id=job["id"], status="failed")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="cgh", description="ChatGPT Web Handoff 确定性外壳")
+    p.add_argument("--root", help="使用方仓库根目录（默认从 cwd 向上找 .git）")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("new", help="新建作业：建目录 + job.json + request.md")
+    s.add_argument("--effort", help=f"档位；省略则从用户原话里认，都没有就用默认 {DEFAULT_EFFORT}")
+    s.add_argument("--action", default="review")
+    s.add_argument("--subject", help="审查对象（等价写法，优先用 -- 后面的原话）")
+    s.add_argument("instruction", nargs=argparse.REMAINDER,
+                   help="`--` 之后原样照抄用户的话，不要复述、不要概括")
+    s.add_argument("--force", action="store_true", help="无视活跃作业强建")
+    s.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("continue", help="在既有对话里追问：建子作业，复用父作业的 ChatGPT 会话")
+    s.add_argument("--from", dest="parent", required=True, help="父作业 job_id")
+    s.add_argument("--effort", help="默认继承父作业；用户原话里点了档位则以原话为准")
+    s.add_argument("--force", action="store_true")
+    s.add_argument("instruction", nargs=argparse.REMAINDER,
+                   help="`--` 之后原样照抄用户的追问，不要复述")
+    s.set_defaults(fn=cmd_continue)
+
+    s = sub.add_parser("submit", help="提交：开新会话 + 选档位 + 注入正文 + 发送 + 等真 URL")
+    s.add_argument("--id", required=True)
+    s.add_argument("--force", action="store_true", help="放行「已提交」「占位符未填」这类内容检查")
+    s.add_argument("--force-resend", action="store_true",
+                   help="只放行发送闸门（确认上次真的没发出去时才用）；其余安全校验照跑")
+    s.add_argument("--allow-model-drift", action="store_true",
+                   help="模型不是钉死的那个也照样提交（默认停下报错）")
+    s.set_defaults(fn=cmd_submit)
+
+    s = sub.add_parser("confirm", help="人工确认发送成功：补对话 URL 并推进到 submitted")
+    s.add_argument("--id", required=True)
+    s.add_argument("--url", required=True, help="浏览器地址栏里那个 /c/<真id> URL")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_confirm)
+
+    s = sub.add_parser("poll", help="读一次生成状态；完成则自动取全文并解析成 result.md")
+    s.add_argument("--id")
+    s.set_defaults(fn=cmd_poll)
+
+    s = sub.add_parser("wait", help="阻塞轮询到出结果（AI 自己等，不用人反复说 poll）")
+    s.add_argument("--id")
+    s.add_argument("--timeout", type=int, default=1800, help="最多等多少秒，默认 1800（Pro 档够用）")
+    s.add_argument("--interval", type=int, default=20, help="两次读之间隔多少秒，默认 20")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("doctor", help="开工自检：9222 / ChatGPT 标签页 / 登录态")
+    s.add_argument("--deep", action="store_true", help="开一个临时标签页实测登录态与当前档位")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("state", help="输出当前作业状态（供 SKILL.md 动态注入）")
+    s.add_argument("--id")
+    s.set_defaults(fn=cmd_state)
+
+    s = sub.add_parser("update", help="更新 job.json（带状态机校验）")
+    s.add_argument("--id", required=True)
+    s.add_argument("--set", action="append", default=[], metavar="k=v")
+    s.add_argument("--note")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_update)
+
+    s = sub.add_parser("parse", help="解析哨兵块 → result.md")
+    s.add_argument("--id", required=True)
+    s.add_argument("--from", dest="source", required=True, help="ChatGPT 回答原文文件")
+    s.set_defaults(fn=cmd_parse)
+
+    s = sub.add_parser("outcome", help="记下结论的下场：采纳/部分采纳/驳回（skill 进化的唯一信号）")
+    s.add_argument("--id", required=True)
+    s.add_argument("--status", required=True,
+                   help="adopted | partial | rejected")
+    s.add_argument("--commit", help="落实这条结论的 commit sha")
+    s.add_argument("--note", help="哪条建议真有用、哪条照做反而是坑——写具体点，将来靠它进化")
+    s.set_defaults(fn=cmd_outcome)
+
+    s = sub.add_parser("backfill", help="把本仓库已有作业补进全机账本（幂等）")
+    s.set_defaults(fn=cmd_backfill)
+
+    s = sub.add_parser("stats", help="跨仓统计：档位性价比、发起方分布、结论采纳率")
+    s.add_argument("--json", action="store_true", help="出机器可读的原始聚合")
+    s.set_defaults(fn=cmd_stats)
+
+    s = sub.add_parser("list", help="列出本仓库全部作业")
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("abort", help="中止作业并释放并发槽位")
+    s.add_argument("--id", required=True)
+    s.add_argument("--reason")
+    s.set_defaults(fn=cmd_abort)
+
+    a = p.parse_args()
+    if getattr(a, "id", None) and not ID_RE.match(a.id):
+        die("bad_id", f"job_id 格式非法：{a.id}（应形如 hf_20260819_a3f1c7）")
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

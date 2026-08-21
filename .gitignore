@@ -1,0 +1,40 @@
+# macOS
+.DS_Store
+
+# MS Office 锁文件/临时文件
+~$*
+
+# 执行态目录（任务总线与原始日志，不进 git）
+tmp/
+logs/
+*.log
+
+# Handoff 运行产物（本仓库自测时产生；真实作业落在使用方仓库）
+.chatgpt/web-handoff/*
+!.chatgpt/web-handoff/.gitkeep
+
+# 敏感文件
+.env
+.env.*
+!.env.example
+*.cookies
+*cookies*.json
+token*.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ── 开发过程记录：留在本地，不进公开仓 ──
+# 别人拉这个仓库是为了用工具，不是看我的调研和调试过程。
+# 这些文件继续在磁盘上、继续照常用，只是不 track。
+# 全部设计与调研文档留本地，不进公开仓（.gitignore 不支持行尾注释，别写一行）
+docs/
+reports/
+config/effort-map.yaml
+*.local.md
+notes/
+templates/task-bus/
+AGENTS.local.md
+CLAUDE.local.md

@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@1.7.0",
+        "--browserUrl", "http://127.0.0.1:9222",
+        "--no-usage-statistics",
+        "--no-performance-crux",
+        "--no-category-performance",
+        "--no-category-network",
+        "--no-category-emulation",
+        "--screenshotFormat", "webp",
+        "--screenshotMaxWidth", "1280"
+      ]
+    }
+  }
+}

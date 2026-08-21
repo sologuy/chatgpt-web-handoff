@@ -1,0 +1,20 @@
+{
+  "id": "hf_YYYYMMDD_xxxxxx",
+  "schema_version": 1,
+  "status": "created",
+  "action": "review",
+  "effort_requested": "high",
+  "effort_actual": null,
+  "effort_available": [],
+  "conversation_url": null,
+  "page_id": null,
+  "created_at": null,
+  "updated_at": null,
+  "submitted_at": null,
+  "completed_at": null,
+  "poll_count": 0,
+  "last_len": 0,
+  "result_file": null,
+  "error": null,
+  "notes": []
+}
