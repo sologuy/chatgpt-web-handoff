@@ -1067,8 +1067,11 @@ def _poll_once(d, job_id, hold=None):
         # 续聊时最后一条助手消息一开始还是上一轮那条（已完成、且不含本轮哨兵）。
         # 不排除掉它，连续两次读到同一条就会被判成「停了」，把上一轮的答案
         # 当作本轮结果落成 no_sentinel 终态。
+        # ChatGPT 会虚拟化长对话：旧的助手消息被移出 DOM，assistant_msgs 因此**不单调递增**。
+        # 续聊轮次一多，count 就停在原地，"新回合出现了吗"永远判不出来，poll 卡死在 generating。
+        # 哨兵串里带本作业的 job_id，上一轮的回答里不可能出现 —— 它出现即证明这是本轮的新回合。
         tb = job.get("turns_before")
-        new_turn = tb is None or prog.get("assistant_msgs", 0) > tb
+        new_turn = tb is None or prog.get("assistant_msgs", 0) > tb or sentinel
 
         # 页面结构还认得出来吗？认不出来就不能拿「没有停止按钮」当「生成完了」——
         # ChatGPT 改个 testid，每次 poll 都会立刻看起来像"已完成"，静默给出半截结果。
