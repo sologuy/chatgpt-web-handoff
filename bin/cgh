@@ -488,6 +488,7 @@ def cmd_new(a):
         (jd / "request.md").write_text(
             tpl.read_text(encoding="utf-8")
                .replace("{{JOB_ID}}", job_id)
+               .replace("{{TIMESTAMP}}", now()[:19].replace("T", " "))
                .replace("{{SUBJECT}}", subject),
             encoding="utf-8")
     ledger_append("created", root, job)
@@ -559,7 +560,9 @@ def cmd_continue(a):
             die("no_template", f"模板缺失：{tpl}")
         (jd / "request.md").write_text(
             tpl.read_text(encoding="utf-8")
-               .replace("{{JOB_ID}}", job_id).replace("{{SUBJECT}}", subject),
+               .replace("{{JOB_ID}}", job_id)
+               .replace("{{TIMESTAMP}}", now()[:19].replace("T", " "))
+               .replace("{{SUBJECT}}", subject),
             encoding="utf-8")
     ledger_append("created", root, job)
     ok(job_id=job_id, dir=str(jd), request=str(jd / "request.md"), status="created",
@@ -873,6 +876,10 @@ def cmd_submit(a):
             page, target_id = web.open_new_chat(owned_ids=owned)
         web.guard_host(page)
         turns_before = web.count_assistant(page) if continuing else 0
+        # 条数不可靠（虚拟化会把旧消息移出 DOM），所以另记一份内容指纹：
+        # 只要最后一条助手消息的内容变了，就说明新回合已经出现。
+        # 这条判据既不依赖计数单调，也不依赖对方守哨兵格式。
+        tail_before = _tail_sig(web.read_progress(page)) if continuing else None
         # 正文超长时 ChatGPT 会转成附件，格式要求会跟着沉进去。
         # 把哨兵那一段单独内联，保证输出格式指令 ChatGPT 一定看得见。
         injected = web.inject(page, body, tail=_format_tail(job["id"], body))
@@ -920,8 +927,9 @@ def cmd_submit(a):
                         job_id=a.id, send_attempted_at=fresh["send_attempted_at"])
                 fresh["send_attempted_at"] = now()
                 if continuing:
-                    # 记下发送前的助手消息数：poll 要靠它区分「新回合」与「上一轮的旧回答」
+                    # 记下发送前的现场：poll 要靠它区分「新回合」与「上一轮的旧回答」
                     fresh["turns_before"] = turns_before
+                    fresh["tail_before"] = tail_before
                 save_job(d, fresh)          # 先落盘再按发送：崩在中间也留得下痕迹
 
             # 从这里往下就是非幂等区。click 派发到一半断连、URL 等超时、甚至事后本地写盘失败，
@@ -1011,6 +1019,16 @@ def cmd_confirm(a):
        hint=f"cgh poll --id {job['id']}")
 
 
+def _tail_sig(prog):
+    """最后一条助手消息的内容指纹。没有助手消息时返回 None。
+
+    只存哈希不存原文 —— job.json 会进使用方仓库的目录，不该多带一份对话内容。
+    """
+    if not prog or not prog.get("assistant_msgs"):
+        return None
+    return sha256(f'{prog.get("len", 0)}|{prog.get("tail", "")}')
+
+
 def _poll_once(d, job_id, hold=None):
     """读一次生成状态。返回 (done: bool, payload: dict)。
 
@@ -1070,8 +1088,17 @@ def _poll_once(d, job_id, hold=None):
         # ChatGPT 会虚拟化长对话：旧的助手消息被移出 DOM，assistant_msgs 因此**不单调递增**。
         # 续聊轮次一多，count 就停在原地，"新回合出现了吗"永远判不出来，poll 卡死在 generating。
         # 哨兵串里带本作业的 job_id，上一轮的回答里不可能出现 —— 它出现即证明这是本轮的新回合。
+        # 判「新回合出现了没有」有三条独立判据，任一成立即可 —— 单靠哪一条都会漏：
+        #   ① 助手消息数增加 —— 但 ChatGPT 虚拟化长对话会把旧消息移出 DOM，条数不单调递增
+        #   ② 本作业的哨兵出现 —— 但对方不守格式时就没有哨兵
+        #   ③ 最后一条助手消息的内容指纹变了 —— 对上面两种情况都免疫
+        # 只有三条全不成立才继续等，这样既不会把上一轮的答案当本轮结果，也不会卡死。
         tb = job.get("turns_before")
-        new_turn = tb is None or prog.get("assistant_msgs", 0) > tb or sentinel
+        tsb = job.get("tail_before")
+        new_turn = (tb is None
+                    or prog.get("assistant_msgs", 0) > tb
+                    or sentinel
+                    or (tsb is not None and _tail_sig(prog) != tsb))
 
         # 页面结构还认得出来吗？认不出来就不能拿「没有停止按钮」当「生成完了」——
         # ChatGPT 改个 testid，每次 poll 都会立刻看起来像"已完成"，静默给出半截结果。
