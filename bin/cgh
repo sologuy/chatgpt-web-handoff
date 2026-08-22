@@ -281,6 +281,16 @@ def detect_origin(root):
             # 目录名是启动时 cwd 的 slug，不一定等于仓库根，所以搜一遍
             hits = list((Path.home() / ".claude" / "projects").glob(f"*/{o['session_id']}.jsonl"))
             o["transcript"] = str(hits[0]) if hits else None
+    elif e.get("DSH_SESSION_ID"):
+        # DSH 把会话 id 注入**工具 shell**（不是服务进程，去翻服务进程的 env 会扑空）。
+        # 不要取 DSH_PTY_SESSION_ID——那是底层终端进程 id，不是对话 id。
+        o["harness"] = "dsh"
+        o["session_id"] = e.get("DSH_SESSION_ID")
+        # DSH_HOME 是按项目走的，不能假定 ~/.dsh
+        home = e.get("DSH_HOME")
+        if home:
+            hits = list(Path(home).glob(f"sessions/*/{o['session_id']}/session.jsonl.zstd"))
+            o["transcript"] = str(hits[0]) if hits else None
     elif e.get("CODEX_SESSION_ID"):
         # Codex CLI 原生。会话记录：~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<sid>.jsonl
         o["harness"] = "codex"
@@ -294,7 +304,7 @@ def detect_origin(root):
         t = e.get("CODEX_COMPANION_TRANSCRIPT_PATH")
         o["transcript"] = t if t and Path(t).exists() else None
     else:
-        # 认不出的 harness（DSH 等）：AI_AGENT 原值照记，另外记下有哪些
+        # 认不出的 harness：AI_AGENT 原值照记，另外记下有哪些
         # *_SESSION_ID 变量**的名字**（只记名字不记值）——下次看账本就知道该接哪个。
         names = sorted(k for k in e if k.endswith("_SESSION_ID"))
         if names:
