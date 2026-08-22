@@ -206,6 +206,7 @@ $CGH backfill                                # 把本仓库已有作业补进全
 | `effort_drifted` | 发送前复验发现档位被别的 harness 改走了 | 本次**未发送、不消耗额度**。直接重跑 `submit` 即可 |
 | `browser_busy` | 另一个 cgh 正占着「设档位→发送」的临界区 | 同上，重跑即可。一直报就是有进程卡死了 |
 | `rate_limited` | 撞额度 | **不自动重投** |
+| `inject_mismatch` | 正文粘进去了，但落入的字数与预期对不上 | 报出两个数字。**不要直接重投**——先确认是不是正文里有会被 UI 改写的内容（URL 会被转成 pill、显示时藏掉 scheme+host）。这条报错本身也可能是 cgh 的量法过时了 |
 | `no_sentinel` | ChatGPT 没按格式收尾 | 原文已存 `raw-last-message.txt`，交用户判断。**不要自己补字段、不要重跑** |
 
 ---

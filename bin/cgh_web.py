@@ -281,10 +281,36 @@ _CHIPS_JS = """
         .filter(e => _hit(e) && ![...e.children].some(_hit)).length;
 """
 
+# 量「会被发出去的文本」，不是量渲染结果。
+# ChatGPT 会把粘进来的 URL 转成 inline selection pill（一个 contenteditable=false 的
+# <span>，完整 URL 存在 data-id 里，显示时藏掉 scheme+host 并另起一行）。
+# 于是 innerText 比原文短——2026-08-22 实测一条 GitHub 链接就少 18 字，
+# 正好顶穿容差，把一发完全正常的提交判成注入失败。
+# 另外整段正文只落在一个 <p> 里，换行是 <br>，所以不能按段落切。
+_TEXT_JS = r"""
+    const _logical = () => {
+        const el = document.querySelector('#prompt-textarea');
+        if (!el) return '';
+        const out = [];
+        const walk = n => {
+            if (n.nodeType === 3) { out.push(n.data); return; }
+            if (n.nodeType !== 1) return;
+            if (n.tagName === 'BR') { out.push('\n'); return; }
+            if (n.hasAttribute('data-inline-selection-pill'))
+                { out.push(n.getAttribute('data-id') || n.innerText); return; }
+            const block = /^(P|DIV|LI|BLOCKQUOTE|PRE|H[1-6])$/.test(n.tagName);
+            if (block && out.length && !out[out.length - 1].endsWith('\n')) out.push('\n');
+            [...n.childNodes].forEach(walk);
+        };
+        [...el.childNodes].forEach(walk);
+        return out.join('');
+    };
+"""
+
 _PASTE_JS = """
     const el = document.querySelector('#prompt-textarea');
     if (!el) return {ok: false, why: 'no_composer'};
-""" + _CHIPS_JS + """
+""" + _TEXT_JS + _CHIPS_JS + """
     const before = document.querySelectorAll('[data-message-author-role]').length;
     const chips_before = chips();
     el.focus();
@@ -300,7 +326,7 @@ _PASTE_JS = """
     let last = null, stable = 0;
     while (Date.now() < deadline) {
         await new Promise(r => setTimeout(r, 250));
-        const now = {len: el.innerText.trim().length, chips: chips()};
+        const now = {len: _logical().trim().length, chips: chips()};
         const settled = (now.len >= want * 0.99) || (now.len === 0 && now.chips > chips_before);
         if (last && now.len === last.len && now.chips === last.chips) {
             if (++stable >= 2 && settled) break;
@@ -308,7 +334,8 @@ _PASTE_JS = """
         last = now;
     }
     const sendBtn = document.querySelector('[data-testid="send-button"]');
-    return {ok: true, len: el.innerText.trim().length,
+    return {ok: true, len: _logical().trim().length,
+            inner_len: el.innerText.trim().length,
             chips_before: chips_before, chips_after: chips(),
             send_enabled: sendBtn ? !sendBtn.disabled : null,
             msgs_delta: document.querySelectorAll('[data-message-author-role]').length - before};
@@ -317,7 +344,7 @@ _PASTE_JS = """
 # 清残留附件：selectAll+delete 只清 composer，**清不掉附件**（2026-08-21 实测）。
 # 附件卡片上没有移除键，唯一的出路是点「在文本字段中显示」把它还原成内联文本再删。
 _DROP_CHIPS_JS = """
-""" + _CHIPS_JS + """
+""" + _TEXT_JS + _CHIPS_JS + """
     const el = document.querySelector('#prompt-textarea');
     for (let i = 0; i < 6 && chips() > 0; i++) {
         const btn = [..._form.querySelectorAll('button,[role=button]')].find(
@@ -329,7 +356,7 @@ _DROP_CHIPS_JS = """
         await new Promise(r => setTimeout(r, 500));
     }
     el.focus(); document.execCommand('selectAll'); document.execCommand('delete');
-    return {chips: chips(), composer: el.innerText.trim().length};
+    return {chips: chips(), composer: _logical().trim().length};
 """
 
 

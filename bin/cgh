@@ -792,6 +792,11 @@ def _classify(exc):
         return "remote_debug_denied", "remote_debug_denied"
     if "解冻失败" in m:
         return "ui_changed", "background_unfreeze_failed"
+    if "注入形态不对" in m:
+        # 内联和附件两条路都没走通。这条消息里也带「附件数 x → y」，但根因通常
+        # 与附件无关（比如正文被 UI 改写过），归到 attachment_state 会把人
+        # 引去查一个根本不存在的遗留附件。
+        return "failed", "inject_mismatch"
     if "附件" in m:
         # 不是 ChatGPT 改版。要么页面脏（有别人的遗留附件），要么注入形态没落到
         # inline/attachment 任一条。归到 ui_changed 会把人引去查一个不存在的改版。
