@@ -34,7 +34,7 @@ open -a "Google Chrome" --args --remote-debugging-port=9222
 
 ## 这个连接看得到什么
 
-连的是你日常 Profile，MCP 能列出**全部标签页**。2026-08-19 实测时这台机器上同时开着 GitLab、飞书管理后台、百炼控制台（URL 里带 apiKey）、内网 dev-sap。
+连的是你日常 Profile，MCP 能列出**全部标签页**——包括代码托管、企业后台、云控制台、内网系统，其中一部分的 URL 本身就带凭证（不少控制台会把 token 或 apiKey 放在 query string 里）。
 
 因此 Skill 侧有一条硬约束（`AGENTS.md` §6-2）：任何 `click` / `fill` / `type_text` / `upload_file` 之前必须先校验目标页 host ∈ `chatgpt.com`，不匹配立即停止。**边界靠这条规则守，不靠"记得关掉敏感页面"。**
 
