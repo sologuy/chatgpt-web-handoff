@@ -13,6 +13,8 @@ SKILL_LINK="$HOME/.claude/skills/chatgpt-handoff"
 # ~/.agents/skills 是 Codex / DSH 共读的用户级 skill 目录（DSH 的 agentsHome 默认就是它）。
 AGENTS_SKILL_LINK="$HOME/.agents/skills/chatgpt-handoff"
 CODEX_SKILL_LINK="$HOME/.codex/skills/chatgpt-handoff"
+# Hermes 读 ~/.hermes/skills，顶层放 symlink 就能被它收录（实测同目录下已有先例）。
+HERMES_SKILL_LINK="$HOME/.hermes/skills/chatgpt-handoff"
 
 ok(){ printf '  ✅ %s\n' "$1"; }
 no(){ printf '  ❌ %s\n' "$1"; FAIL=1; }
@@ -47,8 +49,11 @@ else
 fi
 
 echo
-echo "== 安装 Skill（Claude Code / Codex / DSH 共用同一份） =="
-for link in "$SKILL_LINK" "$AGENTS_SKILL_LINK" "$CODEX_SKILL_LINK"; do
+echo "== 安装 Skill（各 harness 共用同一份） =="
+LINKS=("$SKILL_LINK" "$AGENTS_SKILL_LINK" "$CODEX_SKILL_LINK")
+# Hermes 只在已安装时才链——没装的人不需要凭空多一个 ~/.hermes 目录
+[ -d "$HOME/.hermes" ] && LINKS+=("$HERMES_SKILL_LINK")
+for link in "${LINKS[@]}"; do
   mkdir -p "$(dirname "$link")"
   if [ -e "$link" ] && [ ! -L "$link" ]; then
     no "$link 已存在且不是 symlink，请先手工处理（不覆盖你的文件）"
