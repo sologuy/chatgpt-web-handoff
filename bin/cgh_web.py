@@ -6,6 +6,7 @@
 - 发送后 URL 要等到服务端真 id，中间会短暂停在 /c/WEB:<临时id>
 """
 
+import json
 import os
 import time
 from pathlib import Path
@@ -378,6 +379,9 @@ _UPLOADS_JS = """
         .filter(b => /^(移除文件|Remove file)/.test(b.getAttribute('aria-label') || ''));
     const _upNames = () => _upBtns().map(
         b => (b.getAttribute('aria-label') || '').replace(/^(移除文件|Remove file)\s*\d*\s*[:：]\s*/, ''));
+    // 注意：卡片里那个转圈**不能**当就绪判据。实测它在上传完成之后才出现
+    // （卡片先转圈消失 →3s→ 又回来），而且长期不消失；带着它按发送照样能发出去
+    // （实测 1s 拿到 URL）。它是上传完成后的二次处理指示，不是「还没传完」。
 """
 
 # 文件输入框：ChatGPT 有三个 input[type=file]，#upload-photos / #upload-camera
@@ -422,9 +426,9 @@ def attach_files(page, paths, timeout=180):
     所以只认「卡片数正好 +N 且连续两次读数一致」，不用固定 sleep。
     发送按钮不能当就绪信号——它在上传开始前就是可用的（实测 t=1s 即 True）。
 
-    已知局限：卡片数稳定只能证明 composer 建好了节点，不严格等于服务端已收妥。
-    下面的名字核对是个不错的旁证（aria-label 里是服务端定的最终文件名，重名会
-    被加 (1) 后缀，说明已经回过一趟服务端），但仍不是上传完成的强证明。
+    就绪判据只有两条：卡片数正好 +N 且连续两次稳定，加上文件名对得上。
+    别拿卡片里的转圈当判据——见 _UPLOADS_JS 里的注释，那是上传完成之后
+    才出现的二次处理指示，长期不灭，用它当判据会把好端端的附件判成没传完。
     """
     if len(paths) > MAX_ATTACHMENTS:
         raise CdpError(f"一次最多 {MAX_ATTACHMENTS} 个附件，给了 {len(paths)} 个")
@@ -535,8 +539,40 @@ def inject(page, text, tail=None):
                    f"（内联和附件两条路都没走通）")
 
 
-def send(page):
+class SendNotTaken(CdpError):
+    """点了发送但页面没有任何反应——**确证没发出去**，重跑是安全的。"""
+
+
+def send(page, confirm=8):
+    """点发送，并确认它真的生效了。
+
+    只点不验的代价：2026-08-26 一个 Pro 档作业带附件提交，点击没落到实处，
+    然后只能干等 URL 超时，最后报 send_unknown——事后人工去翻标签页才确认
+    「0 条消息、草稿还在」，也就是压根没发。那次白等 60 秒还留下个要人工裁决的作业。
+
+    发送生效的**本地**信号是输入框被清空（比 URL 变化早得多，也不受
+    Pro 档长思考影响）。清空了就认；到点还原样不动，那就是确证没发出去。
+    """
+    before = page.evaluate(
+        "(() => { const el = document.querySelector('#prompt-textarea');"
+        " return el ? el.innerText.trim().length : -1; })()", timeout=20)
     page.click_js("document.querySelector('[data-testid=\"send-button\"]')", "发送按钮")
+    if before <= 0:
+        return                      # 正文走的是附件形态，输入框本来就空，验不了
+    deadline = time.time() + confirm
+    while time.time() < deadline:
+        time.sleep(0.5)
+        st = page.evaluate("""(() => {
+            const el = document.querySelector('#prompt-textarea');
+            return JSON.stringify({len: el ? el.innerText.trim().length : -1,
+                                   users: document.querySelectorAll('[data-message-author-role=user]').length,
+                                   url: location.pathname});
+        })()""", timeout=20)
+        st = json.loads(st)
+        if st["len"] == 0 or st["users"] > 0 or st["url"].startswith("/c/"):
+            return
+    raise SendNotTaken(f"点了发送但 {confirm}s 内输入框没被清空（仍 {before} 字）、"
+                       "也没有出现新消息——确证没发出去")
 
 
 CONV_URL_JS = """(() => {

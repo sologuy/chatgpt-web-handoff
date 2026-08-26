@@ -971,6 +971,7 @@ def cmd_submit(a):
 
             # 发送前最后一眼：确认档位没被别人改走。此刻还没跨发送边界，中止是安全的。
             web.guard_host(page)
+
             settled = web.read_effort(page)
             if settled not in web._labels(job["effort_requested"]):
                 page.close()
@@ -1001,7 +1002,20 @@ def cmd_submit(a):
             # 从这里往下就是非幂等区。click 派发到一半断连、URL 等超时、甚至事后本地写盘失败，
             # 都不能证明「没发出去」——一律按不确定处理，绝不自动重投。
             try:
-                web.send(page)
+                try:
+                    web.send(page)
+                except web.SendNotTaken as e:
+                    # 确证没发出去，那就把刚打的发送戳撤回——否则下次 submit
+                    # 会被幂等闸门拦住，逼人去做 confirm / --force-resend，
+                    # 而那两条都是给「真不确定」准备的，这里并不是。
+                    with Lock(d):
+                        j = load_job(d, a.id)
+                        j["send_attempted_at"] = None
+                        j["notes"].append(f"{now()} send_not_taken: {e}")
+                        save_job(d, j)
+                    page.close()
+                    die("send_not_taken", str(e), job_id=a.id,
+                        hint="确证未发送、不消耗额度，直接重跑 submit 即可")
                 if continuing:
                     # 续聊时 URL 不变，wait_conversation_url 会立刻返回、等于没验。
                     # 改看真实证据：新回合出现（助手消息数增加或停止按钮亮起）。
