@@ -441,12 +441,25 @@ def cmd_new(a):
     if a.action not in ACTIONS:
         die("bad_action", f"未知动作：{a.action}", allowed=sorted(ACTIONS))
     tail = [x for x in (a.instruction or []) if x != "--"]
-    subject = (" ".join(tail).strip() or (a.subject or "").strip())
-    if len(subject) < 8:
-        die("no_subject", "必须给出审查对象（≥8 字）—— 用户原话，不要让模型自行推断要审什么",
-            hint='cgh new --action review -- 用 pro 模式审查 X 的 Y 决策是否成立')
+    # `--` 之后是 REMAINDER，把 `--subject xxx` 写在它后面会被整段吞进原话，
+    # 于是 agent 自己写的文字被冻结成「用户原话」并参与哈希——静默且致命。
+    if any(x.startswith("--subject") for x in tail):
+        die("subject_flag_misplaced",
+            "--subject 必须写在 `--` 之前，否则会被当成用户原话的一部分",
+            hint="cgh new --action review --subject <上下文补全的对象> -- <用户原话>")
+    spoken_text = " ".join(tail).strip()          # 用户原话，冻结进 intent 并参与哈希
+    ctx_subject = (a.subject or "").strip()       # 由上下文补全的审查对象，另记
+    subject = spoken_text or ctx_subject
+    # 用户这轮说的是「可以啊」这类短确认、审查对象只在上下文里时，允许用
+    # --subject 补全：原话照旧冻结，补全的对象单独存、单独标注，绝不合并。
+    if len(subject) < 8 and not (spoken_text and len(ctx_subject) >= 8):
+        die("no_subject", "必须给出审查对象（≥8 字）",
+            hint='原话本身没有审查对象时：cgh new -- <用户原话> --subject <由上下文补全的审查对象>')
+    # 补全的对象只有在和原话并存时才算「补全」；单独给 --subject 仍按原话处理
+    ctx_subject = ctx_subject if (spoken_text and ctx_subject) else ""
 
     # 档位三选一，优先级：用户原话 > --effort > 默认
+    # 只认原话里的档位词——补全的对象是 agent 写的，让它影响档位等于让模型自己定档
     spoken = effort_from_words(subject)
     passed = EFFORT_ALIASES.get(a.effort, a.effort) if a.effort else None
     if passed and passed not in EFFORTS:
@@ -476,7 +489,7 @@ def cmd_new(a):
         jd.mkdir(parents=True)
         job = {
             "id": job_id, "schema_version": SCHEMA_VERSION, "status": "created",
-            "action": a.action, "subject": subject,
+            "action": a.action, "subject": subject, "subject_context": ctx_subject or None,
             "parent_id": None, "continue_from": None, "turns_before": None,
             "effort_requested": effort, "effort_source": effort_source,
             "effort_actual": None,
@@ -499,7 +512,10 @@ def cmd_new(a):
             tpl.read_text(encoding="utf-8")
                .replace("{{JOB_ID}}", job_id)
                .replace("{{TIMESTAMP}}", now()[:19].replace("T", " "))
-               .replace("{{SUBJECT}}", subject),
+               .replace("{{SUBJECT}}", subject)
+               .replace("{{SUBJECT_CONTEXT}}",
+                        f"\n> 审查对象（由当前上下文补全，非用户原话）：{ctx_subject}\n"
+                        if ctx_subject else ""),
             encoding="utf-8")
     ledger_append("created", root, job)
     ok(job_id=job_id, dir=str(jd), request=str(jd / "request.md"),
@@ -572,7 +588,10 @@ def cmd_continue(a):
             tpl.read_text(encoding="utf-8")
                .replace("{{JOB_ID}}", job_id)
                .replace("{{TIMESTAMP}}", now()[:19].replace("T", " "))
-               .replace("{{SUBJECT}}", subject),
+               .replace("{{SUBJECT}}", subject)
+               .replace("{{SUBJECT_CONTEXT}}",
+                        f"\n> 审查对象（由当前上下文补全，非用户原话）：{ctx_subject}\n"
+                        if ctx_subject else ""),
             encoding="utf-8")
     ledger_append("created", root, job)
     ok(job_id=job_id, dir=str(jd), request=str(jd / "request.md"), status="created",
@@ -704,6 +723,7 @@ def render_result(job, parsed, raw):
     return f"""# Handoff Result {job['id']}
 
 - 审查对象（用户原话）：{job.get('subject') or '-'}
+- 审查对象（上下文补全）：{job.get('subject_context') or '-'}
 - request 哈希：{(job.get('request_sha256') or '-')[:16]}
 - 档位来源：{job.get('effort_source') or '-'}
 - 提交：{job.get('submitted_at') or '-'}  ·  完成：{job.get('completed_at') or '-'}  ·  档位：{job.get('effort_actual') or job['effort_requested']}
@@ -793,6 +813,10 @@ def _mark(d, job_id, status, code, msg, **extra):
 
 def _classify(exc):
     """把 CDP 异常归到契约里的状态，而不是一律 failed。"""
+    if isinstance(exc, OSError):
+        # 页面冻结时 Runtime.evaluate 永不返回，socket 直接抛 TimeoutError。
+        # 这不是 ChatGPT 改版，是浏览器侧不响应。
+        return "failed", "cdp_timeout"
     m = str(exc)
     if "白名单" in m:
         return "wrong_page", "wrong_page"
@@ -873,6 +897,16 @@ def cmd_submit(a):
         die("instruction_absent", "request.md 里找不到用户原话，说明正文写跑题了，拒绝提交",
             instruction=intent["raw_instruction"],
             hint="request.md 的「目标」节必须原样包含用户那句话")
+    # 哨兵必须带本作业的 id。正文是从别的作业抄来的时候，标题行好换、
+    # 底部哨兵容易漏——而哨兵一错，对方照做也解析不出来，白发一次。
+    stale = sorted({m for m in re.findall(r"CGH_(?:RESULT|END)_(hf_\w+)", body)
+                    if m != job["id"]})
+    if stale:
+        die("sentinel_mismatch",
+            f"request.md 的哨兵带的是别的作业 id：{', '.join(stale)}",
+            expected=job["id"], found=stale,
+            hint="正文是从别的作业抄来的？把 CGH_RESULT_/CGH_END_ 后面的 id 换成本作业的")
+
     holes = _unfilled_placeholders(body)
     if holes and not a.force:
         die("request_unfilled", "request.md 还有未填写的模板占位符，先补完再提交",
@@ -972,7 +1006,7 @@ def cmd_submit(a):
         if page:
             page.close()
         _mark(d, a.id, "wrong_page", "wrong_page", str(e))
-    except cdp.CdpError as e:
+    except (cdp.CdpError, OSError) as e:
         if page:
             try:
                 (jd / "failed-page.txt").write_text(
@@ -1143,7 +1177,7 @@ def _poll_once(d, job_id, hold=None):
 
         raw = web.read_full(page)
         page.close()
-    except cdp.CdpError as e:
+    except (cdp.CdpError, OSError) as e:
         if page:
             page.close()
         status, code = _classify(e)
@@ -1223,7 +1257,7 @@ def cmd_doctor(a):
     report = {}
     try:
         report["browser"] = cdp.browser_version().get("Browser")
-    except cdp.CdpError as e:
+    except (cdp.CdpError, OSError) as e:
         die("remote_debug_denied", str(e),
             hint='open -a "Google Chrome" --args --remote-debugging-port=9222（先问用户，不要擅自重启）')
     pages = cdp.list_pages()
@@ -1476,7 +1510,9 @@ def main():
     s = sub.add_parser("new", help="新建作业：建目录 + job.json + request.md")
     s.add_argument("--effort", help=f"档位；省略则从用户原话里认，都没有就用默认 {DEFAULT_EFFORT}")
     s.add_argument("--action", default="review")
-    s.add_argument("--subject", help="审查对象（等价写法，优先用 -- 后面的原话）")
+    s.add_argument("--subject",
+                   help="审查对象。原话本身没写明、但上下文唯一明确时用它补全；"
+                        "与 -- 并存时另存另标，不并入被冻结的原话")
     s.add_argument("instruction", nargs=argparse.REMAINDER,
                    help="`--` 之后原样照抄用户的话，不要复述、不要概括")
     s.add_argument("--force", action="store_true", help="无视活跃作业强建")

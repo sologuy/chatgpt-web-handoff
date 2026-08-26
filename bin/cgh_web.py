@@ -124,7 +124,9 @@ def _find_blank_chat(owned_ids=()):
             if clean:
                 return page, p["id"]
             page.close()
-        except CdpError:
+        except (CdpError, OSError):
+            # 冻结的页 evaluate 永不返回，socket 抛的是裸 TimeoutError（OSError 子类）。
+            # 这只说明这一页不能复用，不该让整个 submit 陪葬。
             continue
     return None, None
 
@@ -138,14 +140,16 @@ def open_new_chat(timeout=PAGE_TIMEOUT, owned_ids=()):
     if page is None:
         page, target_id = cdp.open_page("https://chatgpt.com/", timeout=timeout)
     try:
+        # 后台新标签页会被 Chrome 立刻降频（页面一多尤其明显），第一次 evaluate
+        # 可能直接超时而不是返回慢。所以先把它唤醒——unfreeze 自带 30s 预算和重试，
+        # 主线程忙不会误判，反过来省掉后面每一次 evaluate 都要自己扛超时。
+        page.unfreeze()
         guard_host(page)
         _wait(page, "!!document.querySelector('#prompt-textarea')", "输入框就绪", timeout)
         _wait(page, f"(() => {{ const b = {_EFFORT_BTN}; return !!b && b.getBoundingClientRect().width > 0; }})()",
               "档位按钮就绪", timeout)
         if not check_login(page):
             raise CdpError("ChatGPT 未登录或被跳到登录页")
-        # 页面安静下来了，这时才做解冻自检。放在刚加载完那一刻探必假阴（主线程忙）。
-        page.unfreeze()
     except Exception:
         page.close()          # 只断 WS，标签页留着给人看现场
         raise
