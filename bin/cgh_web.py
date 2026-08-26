@@ -543,7 +543,7 @@ class SendNotTaken(CdpError):
     """点了发送但页面没有任何反应——**确证没发出去**，重跑是安全的。"""
 
 
-def send(page, confirm=8):
+def send(page, confirm=12):
     """点发送，并确认它真的生效了。
 
     只点不验的代价：2026-08-26 一个 Pro 档作业带附件提交，点击没落到实处，
@@ -552,27 +552,70 @@ def send(page, confirm=8):
 
     发送生效的**本地**信号是输入框被清空（比 URL 变化早得多，也不受
     Pro 档长思考影响）。清空了就认；到点还原样不动，那就是确证没发出去。
+
+    ⚠️ 重试那一下必须重新定位元素，**绝不能照着缓存坐标再点**：
+    发送成功后按钮会**原地变成 stop**。拿旧坐标补一刀，点到的就是 stop，
+    等于自己把刚发出去的生成掐断，而且看起来像「发送失败」。
+    所以下面每一个「已发出去」的证据里都包含 stop 按钮的出现，
+    只有全部证据都不成立、且 send 按钮还在，才允许换一种方式再点一次。
     """
-    before = page.evaluate(
-        "(() => { const el = document.querySelector('#prompt-textarea');"
-        " return el ? el.innerText.trim().length : -1; })()", timeout=20)
+    _SENT_JS = """(() => {
+        const el = document.querySelector('#prompt-textarea');
+        return JSON.stringify({
+            len: el ? el.innerText.trim().length : -1,
+            users: document.querySelectorAll('[data-message-author-role=user]').length,
+            url: location.pathname,
+            stop: !!document.querySelector('[data-testid="stop-button"]'),
+            send: !!document.querySelector('[data-testid="send-button"]')});
+    })()"""
+
+    def _sent(st):
+        # 任意一条成立就说明这一发已经出去了，绝不能再点
+        return (st["len"] == 0 or st["users"] > 0 or st["url"].startswith("/c/")
+                or st["stop"] or not st["send"])
+
+    before = json.loads(page.evaluate(_SENT_JS, timeout=20))["len"]
     page.click_js("document.querySelector('[data-testid=\"send-button\"]')", "发送按钮")
     if before <= 0:
-        return                      # 正文走的是附件形态，输入框本来就空，验不了
-    deadline = time.time() + confirm
-    while time.time() < deadline:
-        time.sleep(0.5)
-        st = page.evaluate("""(() => {
-            const el = document.querySelector('#prompt-textarea');
-            return JSON.stringify({len: el ? el.innerText.trim().length : -1,
-                                   users: document.querySelectorAll('[data-message-author-role=user]').length,
-                                   url: location.pathname});
-        })()""", timeout=20)
-        st = json.loads(st)
-        if st["len"] == 0 or st["users"] > 0 or st["url"].startswith("/c/"):
-            return
-    raise SendNotTaken(f"点了发送但 {confirm}s 内输入框没被清空（仍 {before} 字）、"
-                       "也没有出现新消息——确证没发出去")
+        return                      # 输入框本来就空，验不了，也就不敢重试
+
+    def _wait(sec):
+        end = time.time() + sec
+        st = None
+        while time.time() < end:
+            time.sleep(0.5)
+            st = json.loads(page.evaluate(_SENT_JS, timeout=20))
+            if _sent(st):
+                return True, st
+        return False, st
+
+    ok, st = _wait(confirm)
+    if ok:
+        return
+
+    # 到这里五条证据都不成立：输入框内容没动、没有新消息、URL 没变、
+    # 没有 stop 按钮、send 按钮还在。也就是确证什么都没发生，补一刀是安全的。
+    #
+    # 残余竞态：这五条都是渲染层现象，请求已经发出但 DOM 还没更新的那一小段
+    # 里会误判成「没发」。实测 DOM 在 0.5s 内就更新（输入框清空、stop 出现、
+    # URL 变 /c/WEB:），这里等 12s 才动手，留了二十多倍余量。
+    # Resource Timing 记不到这个请求（实测发送前后条目数不变），要做到真正
+    # 无竞态得订阅 CDP 的 Network 事件——那要改传输层，暂未做。
+    #
+    # 补刀前再看最后一眼：把「最后一次轮询」到「点击」之间的空隙也收掉。
+    final = json.loads(page.evaluate(_SENT_JS, timeout=20))
+    if _sent(final):
+        return
+    # 换页内事件派发——坐标点击在后台标签页上偶尔会丢。
+    # 这里用选择器当场重新定位，绝不用之前那次的坐标（那个位置现在可能是 stop）。
+    page.evaluate("(() => { const b = document.querySelector('[data-testid=\"send-button\"]');"
+                  " if (b) b.click(); return !!b; })()", timeout=20)
+    ok, st = _wait(confirm)
+    if ok:
+        return
+    raise SendNotTaken(
+        f"点了两次发送（坐标 + 页内派发），{confirm * 2}s 内输入框仍是 {st['len']} 字、"
+        "没有新消息、没有 stop 按钮——确证没发出去")
 
 
 CONV_URL_JS = """(() => {
