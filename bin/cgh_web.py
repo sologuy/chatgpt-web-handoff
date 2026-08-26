@@ -569,12 +569,19 @@ def send(page, confirm=12):
             send: !!document.querySelector('[data-testid="send-button"]')});
     })()"""
 
-    def _sent(st):
-        # 任意一条成立就说明这一发已经出去了，绝不能再点
-        return (st["len"] == 0 or st["users"] > 0 or st["url"].startswith("/c/")
-                or st["stop"] or not st["send"])
+    # 判据一律跟点击前的基线比，不能用绝对值：续聊时 URL 本来就是 /c/...、
+    # 本来就有用户消息，用绝对判据的话点击之前就"已发送"，校验形同虚设。
+    base = json.loads(page.evaluate(_SENT_JS, timeout=20))
+    before = base["len"]
 
-    before = json.loads(page.evaluate(_SENT_JS, timeout=20))["len"]
+    def _sent(st):
+        # 任意一条成立就说明这一发已经出去了，绝不能再点。
+        # 前两条是持久信号（发出去之后一直成立），后两条是瞬时的，
+        # 极速档三秒就生成完、stop 会变回 send，所以不能只靠它们。
+        return (st["len"] == 0 or st["url"] != base["url"]
+                or st["users"] > base["users"]
+                or (st["stop"] and not base["stop"])
+                or (base["send"] and not st["send"]))
     page.click_js("document.querySelector('[data-testid=\"send-button\"]')", "发送按钮")
     if before <= 0:
         return                      # 输入框本来就空，验不了，也就不敢重试
@@ -607,9 +614,11 @@ def send(page, confirm=12):
     if _sent(final):
         return
     # 换页内事件派发——坐标点击在后台标签页上偶尔会丢。
+    # 用 cdp 里那套完整指针序列，**不要用裸 el.click()**：ChatGPT 的按钮是
+    # React 组件，行为绑在 pointerdown/mousedown 上，只发一个 click 事件不触发。
     # 这里用选择器当场重新定位，绝不用之前那次的坐标（那个位置现在可能是 stop）。
     page.evaluate("(() => { const b = document.querySelector('[data-testid=\"send-button\"]');"
-                  " if (b) b.click(); return !!b; })()", timeout=20)
+                  f" return b ? {cdp.Page._JS_CLICK}(b) : false; }})()", timeout=20)
     ok, st = _wait(confirm)
     if ok:
         return

@@ -1011,6 +1011,9 @@ def cmd_submit(a):
                     with Lock(d):
                         j = load_job(d, a.id)
                         j["send_attempted_at"] = None
+                        # 状态也要退回去。只撤发送戳、留着 generating 的话，
+                        # 作业会卡成「活跃但永远等不到回答」，还占着单作业闸门。
+                        j["status"] = "created"
                         j["notes"].append(f"{now()} send_not_taken: {e}")
                         save_job(d, j)
                     page.close()
