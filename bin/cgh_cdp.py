@@ -187,6 +187,27 @@ class Page(Session):
         literal = json.dumps(arg, ensure_ascii=False)
         return self.evaluate(f"(async (ARG) => {{{body}}})({literal})", timeout)
 
+    def set_file_input(self, finder_js, paths, timeout=60):
+        """把本地文件塞进一个 <input type=file>。
+
+        走 DOM.setFileInputFiles 而不是模拟点击——点了会弹系统文件选择框，
+        那是原生窗口，CDP 够不着，一弹就把整条自动化堵死。
+        需要元素的 objectId，所以这里不能用 evaluate（它 returnByValue）。
+        """
+        r = self.call("Runtime.evaluate",
+                      {"expression": "(" + finder_js + ")", "returnByValue": False}, timeout)
+        if "exceptionDetails" in r:
+            raise CdpError(f"定位失败：文件输入框求值异常 {r['exceptionDetails'].get('text')}")
+        obj = r.get("result", {})
+        if obj.get("subtype") == "null" or "objectId" not in obj:
+            raise CdpError("定位失败：页面上没有可用的文件输入框")
+        try:
+            self.call("DOM.setFileInputFiles",
+                      {"files": [str(x) for x in paths], "objectId": obj["objectId"]}, timeout)
+        finally:
+            try: self.call("Runtime.releaseObject", {"objectId": obj["objectId"]}, 10)
+            except Exception: pass
+
     def unfreeze(self, check=True):
         """让后台标签页照常渲染，并自检确实生效了。
 

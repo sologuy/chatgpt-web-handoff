@@ -57,7 +57,7 @@ ACTIONS = {"review", "design", "debug"}
 # 用户没点档位时用它。改这一行即可，不用动别处。
 DEFAULT_EFFORT = "xhigh"    # 极高。用户明确要求：默认就往高了走，别省
 
-# 从用户原话里认档位。刻意要求档位词紧挨着「模式/档」，或者是 pro/最高 这种
+# 从审查对象文本里认档位。刻意要求档位词紧挨着「模式/档」，或者是 pro/最高 这种
 # 本身就无歧义的说法——否则「高并发」「中间件」这类词会被误判成档位。
 EFFORT_IN_WORDS = [
     (r"(?:^|[^a-zA-Z])pro(?![a-zA-Z])", "pro"),
@@ -70,11 +70,11 @@ EFFORT_IN_WORDS = [
 
 
 def effort_from_words(text):
-    """从用户原话里认出档位；认不出返回 None。
+    """从审查对象文本里认出档位；认不出返回 None。
 
-    存在的意义：`--effort` 的值是模型填的，没人校验它忠不忠于用户原话。
+    存在的意义：`--effort` 的值是模型填的，没人校验它忠不忠于用户说的档位。
     用户说「用 pro 模式」而模型填了 high，全链路不会报错——effort_actual 还会
-    回读成"正确的高"，事后查不出来。原话就在 intent.json 里，那就拿它当第二个信源。
+    回读成"正确的高"，事后查不出来。审查对象就在 intent.json 里，那就拿它当第二个信源。
     """
     for pattern, eff in EFFORT_IN_WORDS:
         if re.search(pattern, text, re.IGNORECASE):
@@ -405,10 +405,10 @@ def sha256(text):
 
 
 def write_intent(jd, job_id, raw, action, effort):
-    """把用户原话冻结成不可变记录。
+    """把审查对象冻结成不可变记录。
 
     审查意见（hf_20260819_vr3t8c）指出的根因：只让 LLM 组织内容是对的，但不能顺带
-    让 LLM 决定「用户到底授权了什么任务」。原话必须原样落盘并带哈希，之后任何环节
+    让 LLM 决定「这次到底要审什么」。审查对象必须原样落盘并带哈希，之后任何环节
     都只能引用、不能改写。
     """
     intent = {
@@ -430,36 +430,49 @@ def read_intent(jd):
         return None
     it = json.loads(f.read_text(encoding="utf-8"))
     if sha256(it.get("raw_instruction", "")) != it.get("instruction_sha256"):
-        die("intent_tampered", "intent.json 的哈希对不上，用户原话被改过，拒绝提交",
+        die("intent_tampered", "intent.json 的哈希对不上，审查对象被改过，拒绝提交",
             file=str(f))
     return it
 
 
 # ---------- 子命令 ----------
 
+def _resolve_attachments(items):
+    """把 --attach 的路径查实并转成绝对路径。
+
+    在建作业时就查，不拖到 submit：那时候浏览器已经开好、档位已经设好，
+    再因为一个笔误的路径失败，白折腾一整轮。
+    """
+    out = []
+    for raw in (items or []):
+        p = Path(raw).expanduser()
+        if not p.exists():
+            die("attach_not_found", f"附件不存在：{raw}")
+        if not p.is_file():
+            die("attach_not_file", f"附件不是普通文件：{raw}")
+        try:
+            p.open("rb").close()
+        except OSError as e:
+            die("attach_unreadable", f"附件读不了：{raw}（{e.strerror}）")
+        out.append({"path": str(p.resolve()), "name": p.name, "size": p.stat().st_size})
+    if len(out) > 10:
+        die("attach_too_many", f"一次最多 10 个附件，给了 {len(out)} 个")
+    return out
+
+
 def cmd_new(a):
     if a.action not in ACTIONS:
         die("bad_action", f"未知动作：{a.action}", allowed=sorted(ACTIONS))
     tail = [x for x in (a.instruction or []) if x != "--"]
-    # `--` 之后是 REMAINDER，把 `--subject xxx` 写在它后面会被整段吞进原话，
-    # 于是 agent 自己写的文字被冻结成「用户原话」并参与哈希——静默且致命。
-    if any(x.startswith("--subject") for x in tail):
-        die("subject_flag_misplaced",
-            "--subject 必须写在 `--` 之前，否则会被当成用户原话的一部分",
-            hint="cgh new --action review --subject <上下文补全的对象> -- <用户原话>")
-    spoken_text = " ".join(tail).strip()          # 用户原话，冻结进 intent 并参与哈希
-    ctx_subject = (a.subject or "").strip()       # 由上下文补全的审查对象，另记
-    subject = spoken_text or ctx_subject
-    # 用户这轮说的是「可以啊」这类短确认、审查对象只在上下文里时，允许用
-    # --subject 补全：原话照旧冻结，补全的对象单独存、单独标注，绝不合并。
-    if len(subject) < 8 and not (spoken_text and len(ctx_subject) >= 8):
-        die("no_subject", "必须给出审查对象（≥8 字）",
-            hint='原话本身没有审查对象时：cgh new -- <用户原话> --subject <由上下文补全的审查对象>')
-    # 补全的对象只有在和原话并存时才算「补全」；单独给 --subject 仍按原话处理
-    ctx_subject = ctx_subject if (spoken_text and ctx_subject) else ""
+    # 这里要的是「要审什么」，不是用户的原话。用户那句话常常只是「开始吧」「可以啊」，
+    # 照抄进来既撑不起 request.md，也逼得短确认句根本建不了作业。
+    # 所以由 agent 把审查对象写清楚；冻结与哈希仍然照做，防的是创建后被改。
+    subject = (" ".join(tail).strip() or (a.subject or "").strip())
+    if len(subject) < 8:
+        die("no_subject", "必须写清楚要审什么（≥8 字）",
+            hint='cgh new --action review -- 用 pro 模式审查 X 的 Y 决策是否成立')
 
-    # 档位三选一，优先级：用户原话 > --effort > 默认
-    # 只认原话里的档位词——补全的对象是 agent 写的，让它影响档位等于让模型自己定档
+    # 档位三选一，优先级：审查对象里写了 > --effort > 默认
     spoken = effort_from_words(subject)
     passed = EFFORT_ALIASES.get(a.effort, a.effort) if a.effort else None
     if passed and passed not in EFFORTS:
@@ -468,12 +481,12 @@ def cmd_new(a):
 
     if spoken and passed and spoken != passed:
         die("effort_mismatch",
-            f"用户原话说的是「{spoken}」，但 --effort 传的是「{passed}」",
+            f"审查对象里写的是「{spoken}」，但 --effort 传的是「{passed}」",
             spoken=spoken, passed=passed, subject=subject,
-            hint="以用户原话为准。要么改 --effort，要么确认是不是听错了——不要自己替用户改档位")
+            hint="以用户说的档位为准。要么改 --effort，要么确认是不是听错了——不要自己替用户改档位")
 
     effort = spoken or passed or DEFAULT_EFFORT
-    effort_source = "用户原话" if spoken else ("显式参数" if passed else f"默认（{DEFAULT_EFFORT}）")
+    effort_source = "审查对象" if spoken else ("显式参数" if passed else f"默认（{DEFAULT_EFFORT}）")
 
     root = repo_root(a.root)
     d = handoffs_dir(root)
@@ -489,7 +502,8 @@ def cmd_new(a):
         jd.mkdir(parents=True)
         job = {
             "id": job_id, "schema_version": SCHEMA_VERSION, "status": "created",
-            "action": a.action, "subject": subject, "subject_context": ctx_subject or None,
+            "action": a.action, "subject": subject,
+            "attachments": _resolve_attachments(getattr(a, "attach", None)),
             "parent_id": None, "continue_from": None, "turns_before": None,
             "effort_requested": effort, "effort_source": effort_source,
             "effort_actual": None,
@@ -512,10 +526,7 @@ def cmd_new(a):
             tpl.read_text(encoding="utf-8")
                .replace("{{JOB_ID}}", job_id)
                .replace("{{TIMESTAMP}}", now()[:19].replace("T", " "))
-               .replace("{{SUBJECT}}", subject)
-               .replace("{{SUBJECT_CONTEXT}}",
-                        f"\n> 审查对象（由当前上下文补全，非用户原话）：{ctx_subject}\n"
-                        if ctx_subject else ""),
+               .replace("{{SUBJECT}}", subject),
             encoding="utf-8")
     ledger_append("created", root, job)
     ok(job_id=job_id, dir=str(jd), request=str(jd / "request.md"),
@@ -540,17 +551,17 @@ def cmd_continue(a):
     tail = [x for x in (a.instruction or []) if x != "--"]
     subject = " ".join(tail).strip()
     if len(subject) < 4:
-        die("no_subject", "追问内容不能为空 —— 原样照抄用户的话",
+        die("no_subject", "追问内容不能为空",
             hint=f'cgh continue --from {a.parent} -- 你说的第 3 点能展开讲讲吗')
 
-    # 档位默认继承父作业；用户原话里点了档位则以原话为准
+    # 档位默认继承父作业；追问内容里点了档位则以它为准
     spoken = effort_from_words(subject)
     passed = EFFORT_ALIASES.get(a.effort, a.effort) if a.effort else None
     if spoken and passed and spoken != passed:
-        die("effort_mismatch", f"用户原话说的是「{spoken}」，但 --effort 传的是「{passed}」",
+        die("effort_mismatch", f"追问内容里写的是「{spoken}」，但 --effort 传的是「{passed}」",
             spoken=spoken, passed=passed)
     effort = spoken or passed or parent["effort_requested"]
-    effort_source = "用户原话" if spoken else ("显式参数" if passed else f"继承父作业（{effort}）")
+    effort_source = "追问内容" if spoken else ("显式参数" if passed else f"继承父作业（{effort}）")
 
     with Lock(d):
         busy = active_job(d)
@@ -588,10 +599,7 @@ def cmd_continue(a):
             tpl.read_text(encoding="utf-8")
                .replace("{{JOB_ID}}", job_id)
                .replace("{{TIMESTAMP}}", now()[:19].replace("T", " "))
-               .replace("{{SUBJECT}}", subject)
-               .replace("{{SUBJECT_CONTEXT}}",
-                        f"\n> 审查对象（由当前上下文补全，非用户原话）：{ctx_subject}\n"
-                        if ctx_subject else ""),
+               .replace("{{SUBJECT}}", subject),
             encoding="utf-8")
     ledger_append("created", root, job)
     ok(job_id=job_id, dir=str(jd), request=str(jd / "request.md"), status="created",
@@ -722,8 +730,7 @@ def render_result(job, parsed, raw):
 
     return f"""# Handoff Result {job['id']}
 
-- 审查对象（用户原话）：{job.get('subject') or '-'}
-- 审查对象（上下文补全）：{job.get('subject_context') or '-'}
+- 审查对象：{job.get('subject') or '-'}
 - request 哈希：{(job.get('request_sha256') or '-')[:16]}
 - 档位来源：{job.get('effort_source') or '-'}
 - 提交：{job.get('submitted_at') or '-'}  ·  完成：{job.get('completed_at') or '-'}  ·  档位：{job.get('effort_actual') or job['effort_requested']}
@@ -890,13 +897,13 @@ def cmd_submit(a):
         die("no_request", f"request.md 不存在：{req}")
     intent = read_intent(jd)
     if intent and intent["raw_instruction"] not in (job.get("subject") or ""):
-        die("intent_mismatch", "job.json 的 subject 与 intent.json 的用户原话不一致，拒绝提交",
+        die("intent_mismatch", "job.json 与 intent.json 的审查对象不一致，拒绝提交",
             intent=intent["raw_instruction"], subject=job.get("subject"))
     body = req.read_text(encoding="utf-8")
     if intent and intent["raw_instruction"] not in body:
-        die("instruction_absent", "request.md 里找不到用户原话，说明正文写跑题了，拒绝提交",
+        die("instruction_absent", "request.md 里找不到审查对象，说明正文写跑题了，拒绝提交",
             instruction=intent["raw_instruction"],
-            hint="request.md 的「目标」节必须原样包含用户那句话")
+            hint="request.md 的「目标」节必须原样包含建作业时给的审查对象")
     # 哨兵必须带本作业的 id。正文是从别的作业抄来的时候，标题行好换、
     # 底部哨兵容易漏——而哨兵一错，对方照做也解析不出来，白发一次。
     stale = sorted({m for m in re.findall(r"CGH_(?:RESULT|END)_(hf_\w+)", body)
@@ -929,6 +936,16 @@ def cmd_submit(a):
         # 只要最后一条助手消息的内容变了，就说明新回合已经出现。
         # 这条判据既不依赖计数单调，也不依赖对方守哨兵格式。
         tail_before = _tail_sig(web.read_progress(page)) if continuing else None
+        # 附件先传、正文后注入：上传是异步的，等它落定的时候正文还没进去，
+        # 万一超时也不用回滚已经打好的字。
+        atts = job.get("attachments") or []
+        uploaded = None
+        if atts:
+            gone = [a["name"] for a in atts if not Path(a["path"]).exists()]
+            if gone:
+                raise cdp.CdpError(f"附件在建作业之后被移走了：{gone}")
+            uploaded = web.attach_files(page, [a["path"] for a in atts])
+
         # 正文超长时 ChatGPT 会转成附件，格式要求会跟着沉进去。
         # 把哨兵那一段单独内联，保证输出格式指令 ChatGPT 一定看得见。
         injected = web.inject(page, body, tail=_format_tail(job["id"], body))
@@ -1036,6 +1053,8 @@ def cmd_submit(a):
        effort_requested=job["effort_requested"], effort_actual=job["effort_actual"],
        effort_touched=eff["touched"], model_actual=eff["model"],
        injected_chars=injected["len"], injected_as=injected.get("mode"),
+       attachments=len(job.get("attachments") or []),
+       attachment_names=(uploaded or {}).get("names"),
        requested_chars=injected.get("requested_chars"), page_id=target_id,
        hint=f"稍后 cgh poll --id {job['id']}")
 
@@ -1508,11 +1527,12 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("new", help="新建作业：建目录 + job.json + request.md")
-    s.add_argument("--effort", help=f"档位；省略则从用户原话里认，都没有就用默认 {DEFAULT_EFFORT}")
+    s.add_argument("--effort", help=f"档位；省略则从审查对象里认，都没有就用默认 {DEFAULT_EFFORT}")
     s.add_argument("--action", default="review")
-    s.add_argument("--subject",
-                   help="审查对象。原话本身没写明、但上下文唯一明确时用它补全；"
-                        "与 -- 并存时另存另标，不并入被冻结的原话")
+    s.add_argument("--subject", help="审查对象（等价写法，优先用 -- 后面的内容）")
+    s.add_argument("--attach", action="append", metavar="路径",
+                   help="随交接一起上传的图片或文件，可重复。类型不做限制——"
+                        "ChatGPT 支持什么就支持什么")
     s.add_argument("instruction", nargs=argparse.REMAINDER,
                    help="`--` 之后原样照抄用户的话，不要复述、不要概括")
     s.add_argument("--force", action="store_true", help="无视活跃作业强建")
@@ -1520,7 +1540,7 @@ def main():
 
     s = sub.add_parser("continue", help="在既有对话里追问：建子作业，复用父作业的 ChatGPT 会话")
     s.add_argument("--from", dest="parent", required=True, help="父作业 job_id")
-    s.add_argument("--effort", help="默认继承父作业；用户原话里点了档位则以原话为准")
+    s.add_argument("--effort", help="默认继承父作业；追问内容里点了档位则以它为准")
     s.add_argument("--force", action="store_true")
     s.add_argument("instruction", nargs=argparse.REMAINDER,
                    help="`--` 之后原样照抄用户的追问，不要复述")

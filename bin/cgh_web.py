@@ -8,6 +8,7 @@
 
 import os
 import time
+from pathlib import Path
 
 import cgh_cdp as cdp
 from cgh_cdp import CdpError
@@ -119,8 +120,8 @@ def _find_blank_chat(owned_ids=()):
                 " && !!document.querySelector('#prompt-textarea')"
                 " && document.querySelector('#prompt-textarea').innerText.trim() === '')()"
             )
-            if clean and count_chips(page):
-                clean = False          # 有遗留附件，这页不能用
+            if clean and (count_chips(page) or count_uploads(page)):
+                clean = False          # 有遗留附件或上传件，这页不能用
             if clean:
                 return page, p["id"]
             page.close()
@@ -362,6 +363,99 @@ _DROP_CHIPS_JS = """
     el.focus(); document.execCommand('selectAll'); document.execCommand('delete');
     return {chips: chips(), composer: _logical().trim().length};
 """
+
+
+# ---------------------------------------------------------------- 上传附件
+#
+# 上传件和「超长粘贴自动转的附件卡片」是**两套 UI**：chips() 那套认的是
+# 「在文本字段中显示」的卡片，数上传件一律是 0。别把两者混用。
+#
+# 锚点用每张卡片上的移除按钮：aria-label 形如「移除文件1：a.png」
+# （英文界面是 Remove file 1: ...）。这是定位优先级①的 a11y name；
+# 卡片本身只有 tailwind 生成的 class，改版必变，不能用。
+_UPLOADS_JS = """
+    const _upBtns = () => [...document.querySelectorAll('button,[role=button]')]
+        .filter(b => /^(移除文件|Remove file)/.test(b.getAttribute('aria-label') || ''));
+    const _upNames = () => _upBtns().map(
+        b => (b.getAttribute('aria-label') || '').replace(/^(移除文件|Remove file)\s*\d*\s*[:：]\s*/, ''));
+"""
+
+# 文件输入框：ChatGPT 有三个 input[type=file]，#upload-photos / #upload-camera
+# 限 image/*，只有通吃的那个 accept 为空。挑 accept 最宽的那个——这样支持什么
+# 由 ChatGPT 服务端决定，我们不自己维护一张类型白名单。
+_FILE_INPUT = ("[...document.querySelectorAll('input[type=file]')]"
+               ".sort((a, b) => (a.accept ? 1 : 0) - (b.accept ? 1 : 0))[0]")
+
+MAX_ATTACHMENTS = 10          # ChatGPT 单条消息的上限，先拦住免得白等一场
+
+
+def count_uploads(page):
+    return page.evaluate("(() => {" + _UPLOADS_JS + " return _upBtns().length; })()", timeout=20)
+
+
+def upload_names(page):
+    return page.evaluate("(() => {" + _UPLOADS_JS + " return _upNames(); })()", timeout=20) or []
+
+
+def drop_uploads(page, timeout=30):
+    """清掉输入框里遗留的上传件。返回清完之后还剩几个。
+
+    和遗留附件卡片同样的道理：留着不清就会把上一个作业的文件一起发出去，
+    而且还返回成功。这里只点每张卡片自己的移除键，不碰别的控件。
+    """
+    return page.evaluate("(async () => {" + _UPLOADS_JS + """
+        for (let i = 0; i < 12 && _upBtns().length; i++) {
+            _upBtns()[0].click();
+            await new Promise(r => setTimeout(r, 400));
+        }
+        return _upBtns().length;
+    })()""", timeout=timeout)
+
+
+def attach_files(page, paths, timeout=180):
+    """把本地文件传进输入框，确认全部就位后才返回。
+
+    走 DOM.setFileInputFiles 而不是点「添加文件」——那会弹原生文件选择框，
+    CDP 够不着，一弹就把整条自动化堵死。
+
+    上传是异步的：塞进去之后卡片要等服务端回执才出现（实测数秒）。
+    所以只认「卡片数正好 +N 且连续两次读数一致」，不用固定 sleep。
+    发送按钮不能当就绪信号——它在上传开始前就是可用的（实测 t=1s 即 True）。
+
+    已知局限：卡片数稳定只能证明 composer 建好了节点，不严格等于服务端已收妥。
+    下面的名字核对是个不错的旁证（aria-label 里是服务端定的最终文件名，重名会
+    被加 (1) 后缀，说明已经回过一趟服务端），但仍不是上传完成的强证明。
+    """
+    if len(paths) > MAX_ATTACHMENTS:
+        raise CdpError(f"一次最多 {MAX_ATTACHMENTS} 个附件，给了 {len(paths)} 个")
+    left = drop_uploads(page)
+    if left:
+        raise CdpError(f"输入框里有清不掉的遗留上传件（{left} 个），"
+                       "拒绝在脏页面上提交——否则会把别人的文件一起发出去")
+    want = len(paths)
+    page.set_file_input(_FILE_INPUT, paths)
+
+    deadline = time.time() + timeout
+    stable = last = 0
+    while time.time() < deadline:
+        time.sleep(1)
+        n = count_uploads(page)
+        stable = stable + 1 if n == last else 0
+        last = n
+        if n >= want and stable >= 2:
+            break
+    else:
+        raise CdpError(f"等待超时（{timeout}s）：上传件只就位 {last}/{want} 个")
+    if last != want:
+        raise CdpError(f"上传件数量对不上：就位 {last} 个，期望 {want} 个")
+
+    # 名字也核一遍。ChatGPT 会给重名文件加 (1) 后缀，所以只比对主干。
+    got = upload_names(page)
+    missing = [Path(p).name for p in paths
+               if not any(Path(p).stem in g for g in got)]
+    if missing:
+        raise CdpError(f"上传件名字对不上，缺：{missing}（页面上是 {got}）")
+    return {"count": last, "names": got}
 
 
 def count_chips(page):

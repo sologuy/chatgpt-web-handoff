@@ -61,6 +61,7 @@ cd chatgpt-web-handoff
 CGH=./bin/cgh
 
 $CGH new --action review -- "审一下重试逻辑会不会导致重复扣费"
+$CGH new --action review --attach ./bug.png --attach ./trace.log -- "..."   # 带图片/文件
 $EDITOR .chatgpt/web-handoff/<job_id>/request.md    # 把上下文填进去
 $CGH submit --id <job_id>                            # 立刻返回，不阻塞
 $CGH wait   --id <job_id>                            # 自己等到出结果
@@ -72,7 +73,7 @@ $CGH outcome --id <job_id> --status adopted --note "哪条建议真有用、哪�
 | 命令 | 作用 |
 |---|---|
 | `new` / `continue` | 建作业 / 在**同一个** ChatGPT 对话里追问 |
-| `submit` | 选推理档位、注入正文、发送、拿到对话 URL |
+| `submit` | 上传附件、选推理档位、注入正文、发送、拿到对话 URL |
 | `poll` / `wait` | 读一次进度 / 阻塞到裁决解析完成 |
 | `outcome` | 记下建议有没有被采纳——这是唯一能让它进化的信号 |
 | `stats` | 跨仓统计：档位性价比、发起方分布、采纳率 |

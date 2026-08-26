@@ -62,6 +62,7 @@ Or drive the CLI yourself:
 CGH=./bin/cgh
 
 $CGH new --action review -- "review whether the retry logic can double-charge"
+$CGH new --action review --attach ./bug.png --attach ./trace.log -- "..."   # with images/files
 $EDITOR .chatgpt/web-handoff/<job_id>/request.md    # fill in the context
 $CGH submit --id <job_id>                            # returns immediately
 $CGH wait   --id <job_id>                            # blocks until the answer lands
@@ -73,7 +74,7 @@ $CGH outcome --id <job_id> --status adopted --note "which advice was gold, which
 | Command | What it does |
 |---|---|
 | `new` / `continue` | Create a job / follow up in the *same* ChatGPT conversation |
-| `submit` | Pick the reasoning tier, inject the body, send, capture the conversation URL |
+| `submit` | Upload attachments, pick the reasoning tier, inject the body, send, capture the conversation URL |
 | `poll` / `wait` | Read progress once / block until the verdict is parsed |
 | `outcome` | Record whether the advice was adopted — the only signal that lets this improve |
 | `stats` | Cross-repo stats: tier cost/benefit, who initiated, adoption rate |
