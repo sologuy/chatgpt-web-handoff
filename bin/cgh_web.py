@@ -161,36 +161,103 @@ def open_new_chat(timeout=PAGE_TIMEOUT, owned_ids=()):
 # ---------------------------------------------------------------- 档位
 
 def read_effort(page):
-    return page.evaluate(f"(() => {{ const b = {_EFFORT_BTN}; return b ? b.innerText.trim() : null; }})()")
+    """当前推理强度。
+
+    新版 UI 只在菜单展开时才显示它（旧版能直接从 composer 按钮上读），
+    所以这里自己负责展开再还原。调用方不必关心——发送前复验和 doctor
+    都是这么用的，让它们各自去开菜单只会把这件事重复三遍还容易漏。
+    """
+    opened = False
+    if not _picker_open(page):
+        _open_picker(page)
+        opened = True
+    try:
+        st = page.evaluate(_EFFORT_STATE)
+        return (st or {}).get("label")
+    finally:
+        if opened:
+            _escape(page)
 
 
 def list_effort_options(page):
-    return page.evaluate(
-        "[...document.querySelectorAll('[role=menuitemradio]')]"
-        ".map(r => ({label: r.innerText.replace(/\\s+/g,' ').trim(), checked: r.getAttribute('aria-checked')}))"
-    )
+    """枚举全部档位。会推动滑块，所以只在出错要报「实际有哪些档」时调。"""
+    _, seen = _walk_efforts(page, [])
+    return [{"label": x, "checked": None} for x in seen]
 
 
-_REASONING_ITEM = f"""(() => {{
+# 2026-08-28 改版：推理强度从「展开高级选项 → 点菜单项」变成了**一个 5 档滑块**，
+# 只能用左右方向键推，点不动。同时「模型」不再折叠在高级选项里，直接是一组
+# menuitemradio——注意 list_effort_options 以前正是靠 menuitemradio 取档位的，
+# 现在那里装的是模型，照旧用会把模型名当成档位选项返回。
+_SLIDER_CTRL = f"""(() => {{
   const g = document.querySelector('{_PICKER}');
   if (!g) return null;
   return [...g.querySelectorAll('[role=menuitem]')]
-    .find(e => /推理强度|Reasoning|Thinking/i.test(e.innerText)) || null;
+    .find(e => /^(能力|Capability)$/i.test(e.getAttribute('aria-label') || '')) || null;
 }})()"""
 
-_ADVANCED_TOGGLE = f"""(() => {{
+# 当前档位读 aria-describedby 指向的实时描述：「极高，第 4 项，共 5 项。」
+# 比 aria-valuenow 可靠——序号到名字的映射是 ChatGPT 定的，我们不该自己硬编。
+_EFFORT_STATE = f"""(() => {{
   const g = document.querySelector('{_PICKER}');
   if (!g) return null;
-  return [...g.querySelectorAll('[role=menuitem]')]
-    .find(e => e.hasAttribute('aria-expanded') || /高级|Advanced/i.test(e.innerText)) || null;
+  const s = g.querySelector('[role=slider]');
+  const c = [...g.querySelectorAll('[role=menuitem]')]
+    .find(e => /^(能力|Capability)$/i.test(e.getAttribute('aria-label') || ''));
+  const ids = c ? (c.getAttribute('aria-describedby') || '').split(/\\s+/) : [];
+  const txt = ids.map(i => (document.getElementById(i) || {{}}).innerText || '').join(' ');
+  const m = txt.match(/^\\s*([^，,]+)[，,]\\s*第\\s*(\\d+)\\s*项/)
+         || txt.match(/^\\s*([^,]+),\\s*item\\s*(\\d+)\\s*of\\s*(\\d+)/i);
+  return {{now: s ? +s.getAttribute('aria-valuenow') : null,
+           min: s ? +s.getAttribute('aria-valuemin') : null,
+           max: s ? +s.getAttribute('aria-valuemax') : null,
+           label: m ? m[1].trim() : null}};
 }})()"""
 
-_MODEL_ROW = f"""(() => {{
+_MODEL_CHECKED = f"""(() => {{
   const g = document.querySelector('{_PICKER}');
   if (!g) return null;
-  const e = [...g.querySelectorAll('[role=menuitem]')].find(x => /^模型|^Model/i.test(x.innerText.trim()));
-  return e ? e.innerText.replace(/\\s+/g, ' ').replace(/^(模型|Model)\\s*/i, '').trim() : null;
+  const r = [...g.querySelectorAll('[role=menuitemradio]')]
+    .find(x => x.getAttribute('aria-checked') === 'true')
+    || g.querySelector('[role=menuitemradio]');
+  return r ? r.innerText.replace(/\\s+/g, ' ').trim() : null;
 }})()"""
+
+_LEFT, _RIGHT = ("ArrowLeft", 37), ("ArrowRight", 39)
+
+
+def _focus_slider(page):
+    ok = page.evaluate("(() => { const c = " + _SLIDER_CTRL + "; if (c) c.focus(); return !!c; })()")
+    if not ok:
+        raise CdpError("定位失败：档位滑块（能力）")
+
+
+def _effort_state(page):
+    st = page.evaluate(_EFFORT_STATE)
+    if not st or st.get("label") is None or st.get("now") is None:
+        raise CdpError("定位失败：读不到档位滑块的当前值")
+    return st
+
+
+def _walk_efforts(page, wants):
+    """从最低档一路推到最高，边推边记标签；碰到目标就停在那儿。
+
+    返回 (命中的标签 or None, 走过的全部标签)。
+    没有别的办法枚举——滑块只暴露当前这一档的名字，序号到名字的映射
+    是 ChatGPT 定的，硬编在代码里改版就会错。
+    """
+    _focus_slider(page)
+    st = _effort_state(page)
+    page.press(*_LEFT, times=st["max"] - st["min"])          # 先归零
+    seen = []
+    for i in range(st["max"] - st["min"] + 1):
+        cur = _effort_state(page)["label"]
+        seen.append(cur)
+        if cur in wants:
+            return cur, seen
+        if i < st["max"] - st["min"]:
+            page.press(*_RIGHT)
+    return None, seen
 
 
 def _escape(page, times=2):
@@ -223,7 +290,7 @@ def configure(page, effort):
 
     返回 {model, effort_actual, available, touched}。
 
-    这里刻意不做「已是目标档位就跳过」的优化：模型名藏在「高级」后面，
+    这里刻意不做「已是目标档位就跳过」的优化：模型和当前档位都只在菜单里可见，
     不展开就读不到；而模型是钉死的（本项目只调推理强度、不切模型），
     每次提交都必须实测一眼，不能靠假设。
     """
@@ -231,43 +298,34 @@ def configure(page, effort):
     want = wants[0]
     # 复用的标签页上可能残留着上一轮打开的菜单。不先清场就点，等于把它关掉。
     _escape(page, 2)
-    current = read_effort(page)
     _open_picker(page)
 
-    # 「模型」「推理强度」两行默认折叠在「显示高级选项」后面。注意：折叠时这两行
-    # 仍留在 DOM 里、只是被 overflow:clip 裁掉，所以判断依据必须是「能不能点到」，
-    # 不能是「在不在 DOM 里」——用后者会跳过展开这一步，然后去点一个被裁掉的元素。
-    if not page.hittable(_REASONING_ITEM):
-        page.click_js(_ADVANCED_TOGGLE, "「显示高级选项」")
-        page.wait_hittable(_REASONING_ITEM, "展开后的「推理强度」行")
+    model = page.evaluate(_MODEL_CHECKED)
+    st = _effort_state(page)
 
-    model = page.evaluate(_MODEL_ROW)
-
-    if current in wants:
+    if st["label"] in wants:
         _escape(page)
-        return {"model": model, "effort_actual": current, "available": [], "touched": False}
+        return {"model": model, "effort_actual": st["label"], "available": [], "touched": False}
 
-    page.click_js(_REASONING_ITEM, "「推理强度」子菜单")
-    _wait(page, "document.querySelectorAll('[role=menuitemradio]').length >= 2", "档位子菜单展开")
-
-    labels = [o["label"] for o in list_effort_options(page)]
-    hit = next((L for L in wants if L in labels), None)
+    before = st["now"]
+    hit, seen = _walk_efforts(page, wants)
     if hit is None:
+        # 没这一档就把滑块推回原位再报错——不能让一次失败的提交顺手改掉
+        # 账号级的推理强度偏好，那会影响下一个作业。
+        cur = _effort_state(page)["now"]
+        if cur != before:
+            key, vk = (_RIGHT if before > cur else _LEFT)
+            page.press(key, vk, times=abs(before - cur))
         _escape(page)
-        raise EffortNotFound(want, labels)
+        raise EffortNotFound(want, seen)
 
-    page.click_js(
-        f"[...document.querySelectorAll('[role=menuitemradio]')]"
-        f".find(r => r.innerText.replace(/\\s+/g,' ').trim() === {_js_str(hit)}) || null",
-        f"档位「{hit}」",
-    )
-    time.sleep(0.4)
-    checked = [o["label"] for o in list_effort_options(page) if o["checked"] == "true"]
-    actual = checked[0] if checked else None
+    # 回读复验：滑块是异步更新的，不复验就可能把「还没生效」当成功。
+    settled = _effort_state(page)["label"]
+    if settled not in wants:
+        _escape(page)
+        raise CdpError(f"档位没设上：要 {want}，滑块停在 {settled}")
     _escape(page)
-
-    return {"model": model, "effort_actual": actual or read_effort(page),
-            "available": labels, "touched": True}
+    return {"model": model, "effort_actual": settled, "available": seen, "touched": True}
 
 
 def _js_str(s):

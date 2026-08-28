@@ -187,6 +187,15 @@ class Page(Session):
         literal = json.dumps(arg, ensure_ascii=False)
         return self.evaluate(f"(async (ARG) => {{{body}}})({literal})", timeout)
 
+    def press(self, key, vk, times=1, gap=0.45):
+        """按方向键之类的功能键。ChatGPT 的档位滑块只吃键盘，点不动。"""
+        for _ in range(times):
+            for t in ("rawKeyDown", "keyUp"):
+                self.call("Input.dispatchKeyEvent",
+                          {"type": t, "key": key, "code": key,
+                           "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+            time.sleep(gap)
+
     def set_file_input(self, finder_js, paths, timeout=60):
         """把本地文件塞进一个 <input type=file>。
 
