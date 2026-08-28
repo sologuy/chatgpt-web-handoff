@@ -880,7 +880,22 @@ def cmd_submit(a):
     job = load_job(d, a.id)
     jd = d / job["id"]
     if job["status"] in TERMINAL:
-        die("terminal", f"作业已是终态：{job['status']}")
+        # 因工具自身问题失败的作业（UI 改版、模型漂移、页面不对…）允许 --force 重投：
+        # 这些都没跨过发送边界，request.md 也填好了，逼人重建一遍纯属浪费。
+        # 成功终态（completed / no_sentinel）不给这条路——那是「已经拿到回答」，
+        # 重投就是白花一次额度。发送幂等闸门在下面，仍然照常拦。
+        retryable = job["status"] in ERROR_TERMINAL and not job.get("send_attempted_at")
+        if not (a.force and retryable):
+            die("terminal", f"作业已是终态：{job['status']}",
+                hint=(f"这是工具侧失败且未发送过，修好之后可以 cgh submit --id {job['id']} --force 重投"
+                      if retryable else "成功终态不重投——重投等于白花一次额度，要追问用 cgh continue"))
+        with Lock(d):
+            j = load_job(d, a.id)
+            j["status"] = "created"
+            j["error"] = None
+            j["notes"].append(f"{now()} 从终态 {job['status']} --force 重投")
+            save_job(d, j)
+        job = load_job(d, a.id)
     if job.get("conversation_url") and not a.force:
         die("already_submitted", f"该作业已提交：{job['conversation_url']}（需 --force）")
     # send 闸门只认 --force-resend。--force 用来放行「占位符没填完」这类内容问题，
