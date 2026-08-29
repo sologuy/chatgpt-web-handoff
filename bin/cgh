@@ -88,6 +88,10 @@ ERROR_TERMINAL = {"effort_not_found", "model_changed", "rate_limited",
                   "wrong_page", "ui_changed", "failed"}
 TERMINAL = SUCCESS_TERMINAL | ERROR_TERMINAL
 BLOCKED = {"auth_required", "remote_debug_denied", "send_unknown"}   # 非终态，等人工
+# 轮询期间遇到这些错误码不判终态：生成是在服务端跑的，本地这条 CDP 连接
+# 抖一下并不说明作业死了。实测一次 cdp_timeout 就废掉过一个已生成 11 分钟
+# 的极高档作业——而那时对话里正写到 3363 字，还在继续。
+TRANSIENT_CDP = {"cdp_timeout", "cdp_error", "remote_debug_denied"}
 FORWARD = {
     "created": {"prompt_ready"},
     "prompt_ready": {"submitted"},
@@ -1129,7 +1133,7 @@ def _tail_sig(prog):
     return sha256(f'{prog.get("len", 0)}|{prog.get("tail", "")}')
 
 
-def _poll_once(d, job_id, hold=None):
+def _poll_once(d, job_id, hold=None, resume=False):
     """读一次生成状态。返回 (done: bool, payload: dict)。
 
     poll 与 wait 共用这一段——判完成的逻辑只能有一份，抄第二份迟早两边走岔。
@@ -1146,9 +1150,23 @@ def _poll_once(d, job_id, hold=None):
 
     job = load_job(d, job_id)
     if job["status"] in TERMINAL:
-        jd = d / job["id"]
-        return True, dict(job_id=job["id"], status=job["status"], terminal=True,
-                          result=str(jd / job["result_file"]) if job.get("result_file") else None)
+        # 被传输层抖动误判成终态、但对话还在那儿的作业，允许接着等。
+        # 只放行「失败终态 + 有对话 URL」这一种；已经拿到结果的不放行。
+        if (resume and job["status"] in ERROR_TERMINAL and job.get("conversation_url")):
+            with Lock(d):
+                j = load_job(d, job_id)
+                j["notes"].append(f"{now()} 从终态 {j['status']} 恢复轮询（--resume）")
+                j["status"] = "generating"
+                j["error"] = None
+                save_job(d, j)
+            job = load_job(d, job_id)
+        else:
+            jd = d / job["id"]
+            return True, dict(job_id=job["id"], status=job["status"], terminal=True,
+                              result=str(jd / job["result_file"]) if job.get("result_file") else None,
+                              hint=("这一发已经发出去了、对话还在，可以 --resume 接着等"
+                                    if job.get("conversation_url") and job["status"] in ERROR_TERMINAL
+                                    else None))
 
     def _release(p):
         """wait 持有连接时不能关——一关 override 就没了。"""
@@ -1230,8 +1248,24 @@ def _poll_once(d, job_id, hold=None):
         page.close()
     except (cdp.CdpError, OSError) as e:
         if page:
-            page.close()
+            try:
+                page.close()
+            except Exception:
+                pass
+        if hold is not None:
+            hold["page"] = None            # 丢掉这条连接，下一跳重连
         status, code = _classify(e)
+        # 已经发出去、拿到对话 URL 的作业，传输层抖动只当这一跳没读到。
+        # 判成终态的代价太大：答案就在浏览器里写着，作业却废了，还没有恢复路径。
+        if job.get("conversation_url") and code in TRANSIENT_CDP:
+            with Lock(d):
+                j = load_job(d, job["id"])
+                j["transient_errors"] = j.get("transient_errors", 0) + 1
+                j["notes"].append(f"{now()} 轮询传输异常（{code}），下一跳重连：{e}")
+                save_job(d, j)
+            return False, dict(job_id=job["id"], status="generating", transient=code,
+                               chars=job.get("last_len", 0),
+                               hint="本地 CDP 连接抖动，作业仍在生成；下一跳会重连")
         _mark(d, job["id"], status, code, str(e))
 
     with Lock(d):
@@ -1261,7 +1295,7 @@ def cmd_poll(a):
     job = load_job(d, a.id) if a.id else active_job(d)
     if not job:
         die("no_active", "没有活跃作业")
-    done, payload = _poll_once(d, job["id"])
+    done, payload = _poll_once(d, job["id"], resume=a.resume)
     if not done:
         payload["hint"] = "尚未完成；想让它自己等就用 cgh wait"
     ok(**payload)
@@ -1283,7 +1317,7 @@ def cmd_wait(a):
     tick = 0
     hold = {"page": None}          # 全程复用一个 CDP 连接，断了页面就被重新冻上
     while True:
-        done, payload = _poll_once(d, job["id"], hold)
+        done, payload = _poll_once(d, job["id"], hold, resume=a.resume and tick == 0)
         if done:
             ok(**payload)
             return
@@ -1595,12 +1629,16 @@ def main():
 
     s = sub.add_parser("poll", help="读一次生成状态；完成则自动取全文并解析成 result.md")
     s.add_argument("--id")
+    s.add_argument("--resume", action="store_true",
+                   help="作业被传输层抖动误判成失败、但对话还在时，接着等它")
     s.set_defaults(fn=cmd_poll)
 
     s = sub.add_parser("wait", help="阻塞轮询到出结果（AI 自己等，不用人反复说 poll）")
     s.add_argument("--id")
     s.add_argument("--timeout", type=int, default=1800, help="最多等多少秒，默认 1800（Pro 档够用）")
     s.add_argument("--interval", type=int, default=20, help="两次读之间隔多少秒，默认 20")
+    s.add_argument("--resume", action="store_true",
+                   help="作业被传输层抖动误判成失败、但对话还在时，接着等它")
     s.set_defaults(fn=cmd_wait)
 
     s = sub.add_parser("doctor", help="开工自检：9222 / ChatGPT 标签页 / 登录态")
