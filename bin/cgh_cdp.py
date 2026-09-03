@@ -438,7 +438,12 @@ def _page_ws(target_id):
 def open_page(url, timeout=60, background=True):
     """新开标签页并返回 (Page, target_id)。走浏览器级 Target.createTarget，比 PUT /json/new 稳。
 
-    默认后台创建：这是用户日常在用的 Chrome，不抢焦点、不闪标签页。
+    默认后台创建：不抢焦点、不闪标签页。
+    ⚠️ 实测（macOS / Chrome 151）`background` 这个参数**只在 Android 生效**，
+    桌面端被忽略：新标签页照样成为它所在窗口的活动标签。
+    它不会把 Chrome 这个 App 抢到最前（前台应用不变），但如果用户正看着
+    那个窗口，会看到标签页被切走。要彻底避免就把那个窗口最小化——
+    见 set_window_state()，最小化后页面照常渲染。
     """
     ver = browser_version()
     ws_url = ver.get("webSocketDebuggerUrl")

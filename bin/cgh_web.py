@@ -339,7 +339,11 @@ def _js_str(s):
 # 里面唯一的按钮就是「在文本字段中显示」。文案变了会退化成 0，
 # 下面的「附件数必须 +1」校验会立刻发现，不会静默放行。
 _CHIPS_JS = """
-    const _form = document.querySelector('#prompt-textarea').closest('form') || document.body;
+    // 输入框可能还没渲染出来（续聊时接上已有对话页尤其常见）。
+    // 不判空的话这里直接抛 TypeError: ... reading 'closest'，
+    // 而调用方看到的是一个跟 DOM 完全不沾边的报错，很难往「页面没加载完」上想。
+    const _composer = document.querySelector('#prompt-textarea');
+    const _form = (_composer && _composer.closest('form')) || document.body;
     const _hit = e => /在文本字段中显示|Show in text field/.test(e.textContent);
     const chips = () => [..._form.querySelectorAll('*')]
         .filter(e => _hit(e) && ![...e.children].some(_hit)).length;
@@ -410,6 +414,7 @@ _PASTE_JS = """
 _DROP_CHIPS_JS = """
 """ + _TEXT_JS + _CHIPS_JS + """
     const el = document.querySelector('#prompt-textarea');
+    if (!el) return {chips: chips(), composer: -1, why: 'no_composer'};
     for (let i = 0; i < 6 && chips() > 0; i++) {
         const btn = [..._form.querySelectorAll('button,[role=button]')].find(
             b => /在文本字段中显示|Show in text field/.test(b.getAttribute('aria-label') || b.innerText || ''));
@@ -765,6 +770,9 @@ def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT):
         try:
             page = cdp.attach(page_id)
             guard_host(page)
+            # 复用的标签页也要确认输入框在——它可能刚被导航走又回来，
+            # 或者页面还在重建。不等就会在后面注入时撞上空的 composer。
+            _wait(page, "!!document.querySelector('#prompt-textarea')", "输入框就绪", timeout)
             return page, page_id, False
         except CdpError:
             pass
@@ -777,6 +785,7 @@ def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT):
         # 看起来跟「已完成但没输出」一模一样，会误判。
         _wait(page, "document.querySelectorAll('[data-message-author-role]').length > 0",
               "会话消息渲染", timeout=timeout)
+        _wait(page, "!!document.querySelector('#prompt-textarea')", "输入框就绪", timeout=timeout)
     except Exception:
         page.close()          # 只断 WS，标签页留着给人看现场
         raise
