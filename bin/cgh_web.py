@@ -19,18 +19,28 @@ CHATGPT_HOSTS = {"chatgpt.com", "chat.openai.com"}
 # 本项目只调推理强度、不切模型。模型钉死在这里，实测漂了就停下报人，
 # 不要闷头用另一个模型跑完再交付——那是「能跑通但语义错误」那一类缺陷。
 # 模型升级时改这一行（Skill 是热加载的，不用重启会话）。
-EXPECTED_MODEL = os.environ.get("CGH_EXPECTED_MODEL", "GPT-5.6 Sol")
+# 2026-09-06 起模型选择项里多了「最新」，而且它是默认选中项——它是个别名，
+# 不是具体模型名。所以这里从「钉死一个名字」改成「一组允许的选中项」：
+# 仍然能发现「账号被切到别的模型」，但不会因为官方把默认项改成别名就每次都拦。
+# 实测到的原值照旧记进 job.json，审计链不受影响。
+EXPECTED_MODELS = [x.strip() for x in
+                   os.environ.get("CGH_EXPECTED_MODEL", "最新,Latest,GPT-5.6 Sol").split(",")
+                   if x.strip()]
+EXPECTED_MODEL = EXPECTED_MODELS[0]          # 报错文案用
 
 # 页面加载/控件就绪的等待上限。30s 实测太紧：两个标签页同时加载时，composer 要 33s
 # 才挂载，会把「还没加载完」误报成 ui_changed（ChatGPT 改版）。这两件事的处置完全不同，
 # 误报的代价是让人去查一个根本不存在的改版。
-PAGE_TIMEOUT = 60
+# 2026-09-06 实测：ChatGPT 首屏光等 #prompt-textarea 就要 40 秒，档位按钮再 23 秒，
+# 两步加起来超过原来 60 秒的单步预算，卡在边界上——同样的代码时成时败。
+# 页面变重了，不是结构变了，所以调预算而不是改定位逻辑。
+PAGE_TIMEOUT = int(os.environ.get("CGH_PAGE_TIMEOUT", "150"))
 
 # 每档的标签候选。中文项是 2026-08-19 实测（界面语言 zh-CN）；
 # 英文项未实测，只作候选——命中不了照样置 effort_not_found 停下问人，不静默降级。
 # 首项是"想要的那个"，用于日志与回读比对。
 EFFORT_LABELS = {
-    "instant": ["极速", "Instant"],
+    "instant": ["即时", "极速", "Instant"],
     "medium": ["中", "Medium"],
     "high": ["高", "High"],
     "xhigh": ["极高", "Extra High", "XHigh"],
@@ -214,6 +224,16 @@ _EFFORT_STATE = f"""(() => {{
            label: m ? m[1].trim() : null}};
 }})()"""
 
+# Pro 档时这个开关显示「6 Pro」，其余档位显示档位名本身。
+# 「最新」这个别名看不出实际跑的是哪个模型，这里是唯一的旁证，值得记一笔。
+_MODEL_TOGGLE = f"""(() => {{
+  const g = document.querySelector('{_PICKER}');
+  if (!g) return null;
+  const t = [...g.querySelectorAll('[role=menuitem]')]
+    .find(e => /选择模型|Select model/i.test(e.getAttribute('aria-label') || ''));
+  return t ? (t.innerText || '').replace(/\\s+/g, ' ').trim() : null;
+}})()"""
+
 _MODEL_CHECKED = f"""(() => {{
   const g = document.querySelector('{_PICKER}');
   if (!g) return null;
@@ -301,11 +321,13 @@ def configure(page, effort):
     _open_picker(page)
 
     model = page.evaluate(_MODEL_CHECKED)
+    toggle = page.evaluate(_MODEL_TOGGLE)
     st = _effort_state(page)
 
     if st["label"] in wants:
         _escape(page)
-        return {"model": model, "effort_actual": st["label"], "available": [], "touched": False}
+        return {"model": model, "model_toggle": toggle,
+                "effort_actual": st["label"], "available": [], "touched": False}
 
     before = st["now"]
     hit, seen = _walk_efforts(page, wants)
@@ -324,8 +346,12 @@ def configure(page, effort):
     if settled not in wants:
         _escape(page)
         raise CdpError(f"档位没设上：要 {want}，滑块停在 {settled}")
+    # 档位改过之后 toggle 会跟着变（Pro 档显示「6 Pro」），要重读——
+    # 而且必须赶在 _escape 关掉菜单之前，菜单一关就什么都读不到了。
+    toggle = page.evaluate(_MODEL_TOGGLE)
     _escape(page)
-    return {"model": model, "effort_actual": settled, "available": seen, "touched": True}
+    return {"model": model, "model_toggle": toggle,
+            "effort_actual": settled, "available": seen, "touched": True}
 
 
 def _js_str(s):

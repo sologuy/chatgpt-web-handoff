@@ -46,7 +46,7 @@ EFFORTS = {"instant", "medium", "high", "xhigh", "pro"}
 # 免得每次都要在 Skill 提示词里让模型自己翻译。
 EFFORT_ALIASES = {
     "pro_standard": "pro", "pro_extended": "pro",
-    "极速": "instant", "最快": "instant",
+    "即时": "instant", "极速": "instant", "最快": "instant",
     "中": "medium", "中级": "medium", "中等": "medium",
     "高": "high", "高级": "high",
     "极高": "xhigh", "超高": "xhigh",
@@ -62,6 +62,7 @@ DEFAULT_EFFORT = "xhigh"    # 极高。用户明确要求：默认就往高了�
 EFFORT_IN_WORDS = [
     (r"(?:^|[^a-zA-Z])pro(?![a-zA-Z])", "pro"),
     (r"最高档?位?|顶配", "pro"),
+    (r"即时\s*(?:模式|档位?)?", "instant"),
     (r"极速\s*(?:模式|档位?)?", "instant"),
     (r"极高\s*(?:模式|档位?)?|超高\s*(?:模式|档位?)", "xhigh"),
     (r"高级\s*(?:模式|档位?)|高\s*(?:模式|档位)", "high"),
@@ -979,14 +980,16 @@ def cmd_submit(a):
                 job["effort_actual"] = eff["effort_actual"]
                 job["effort_available"] = eff["available"]
                 job["model_actual"] = eff["model"]
+                job["model_toggle"] = eff.get("model_toggle")
                 job["page_id"] = target_id
                 save_job(d, job)
 
-            if eff["model"] and eff["model"] != web.EXPECTED_MODEL and not a.allow_model_drift:
+            if eff["model"] and eff["model"] not in web.EXPECTED_MODELS and not a.allow_model_drift:
                 page.close()
                 _mark(d, a.id, "model_changed", "model_changed",
-                      f"模型不是钉死的 {web.EXPECTED_MODEL}，实测是 {eff['model']}",
-                      hint="确认无误就改 bin/cgh_web.py 的 EXPECTED_MODEL；只想这次放行用 --allow-model-drift")
+                      f"模型不在允许列表 {web.EXPECTED_MODELS} 里，实测是 {eff['model']}",
+                      hint="确认无误就改 bin/cgh_web.py 的 EXPECTED_MODELS（或设 CGH_EXPECTED_MODEL 环境变量，逗号分隔）；"
+                           "只想这次放行用 --allow-model-drift")
 
             # 发送前最后一眼：确认档位没被别人改走。此刻还没跨发送边界，中止是安全的。
             web.guard_host(page)
