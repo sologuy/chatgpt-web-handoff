@@ -308,6 +308,16 @@ def detect_origin(root):
         o["session_id"] = e.get("CODEX_COMPANION_SESSION_ID")
         t = e.get("CODEX_COMPANION_TRANSCRIPT_PATH")
         o["transcript"] = t if t and Path(t).exists() else None
+    elif e.get("HERMES_SESSION_ID"):
+        # 放在最后一个分支：Hermes 会派生 codex 子任务，那种情况下两个 id 都在，
+        # 但真正在跑 cgh 的是 codex，不是 Hermes。
+        o["harness"] = "hermes"
+        o["session_id"] = e.get("HERMES_SESSION_ID")
+        # 会话文件名是 <时间戳>_<id>.jsonl，而 id 到底是整段还是尾段没有定论，
+        # 所以两头都用通配；匹配不上就照旧记 null，不猜。
+        home = Path(e.get("HERMES_HOME") or (Path.home() / ".hermes"))
+        hits = list(home.glob(f"sessions/*{o['session_id']}*.jsonl"))
+        o["transcript"] = str(hits[0]) if len(hits) == 1 else None
     else:
         # 认不出的 harness：AI_AGENT 原值照记，另外记下有哪些
         # *_SESSION_ID 变量**的名字**（只记名字不记值）——下次看账本就知道该接哪个。
@@ -785,6 +795,13 @@ def cmd_parse(a):
         die("no_sentinel", err, job_id=job["id"], status="no_sentinel",
             raw=str(jd / "raw-last-message.txt"),
             hint="原文已保留，交人判断；不要让模型补写缺失字段")
+    # 人工兜底这条路也得落账本：不写的话，凡是走 parse 收尾的作业在统计里
+    # 永远停在「发出去了没结论」，分母对不上。
+    ledger_append("completed", root_of(d), load_job(d, job["id"]),
+                  verdict=parsed["verdict"], confidence=parsed["confidence"],
+                  findings=len(parsed["findings"]),
+                  recommended_actions=len(parsed["recommended_actions"]),
+                  via="parse")
     ok(job_id=job["id"], status="completed", result=str(jd / "result.md"),
        verdict=parsed["verdict"], confidence=parsed["confidence"],
        summary=parsed["summary"], findings=len(parsed["findings"]),
@@ -1467,8 +1484,12 @@ def cmd_stats(a):
     if not jobs:
         die("empty_ledger", f"账本还是空的：{LEDGER}",
             hint="跑过 cgh new 之后才会有记录")
+    # cgimg 出图写的是同一本账（同一个 ChatGPT 账号，分两本就答不了「今天一共跑了多少次」），
+    # 但它没有裁决/置信度这些维度，混进下面的表只会把分母做大，所以先摘出去单列。
+    imgs = {i: j for i, j in jobs.items() if j.get("action") == "image"}
+    jobs = {i: j for i, j in jobs.items() if i not in imgs}
     if a.json:
-        ok(ledger=str(LEDGER), jobs=len(jobs), detail=jobs)
+        ok(ledger=str(LEDGER), jobs=len(jobs), detail=jobs, images=imgs)
 
     done = {i: j for i, j in jobs.items() if "completed" in j["evs"]}
     print(f"账本 {LEDGER}    作业 {len(jobs)} 个，出结果 {len(done)} 个")
@@ -1511,6 +1532,14 @@ def cmd_stats(a):
                [[OUTCOMES.get(k, str(k)), str(v)] for k, v in
                 sorted(_count(r.get("outcome") for r in oc.values()).items(),
                        key=lambda kv: -kv[1])])
+    if imgs:
+        good = sum(1 for j in imgs.values() if "image" in j["evs"])
+        errs = _count(j["evs"]["image_failed"].get("error") for j in imgs.values()
+                      if "image_failed" in j["evs"])
+        _table("出图（cgimg）", ["次数", "成功", "失败原因"],
+               [[str(len(imgs)), str(good),
+                 " ".join(f"{k}:{v}" for k, v in sorted(errs.items())) or "-"]])
+
     unjudged = len(done) - len(oc)
     if unjudged > 0:
         print(f"\n⚠️  {unjudged} 个作业出了结果但没记下场——"
