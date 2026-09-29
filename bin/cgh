@@ -1246,6 +1246,18 @@ def _poll_once(d, job_id, hold=None, resume=False):
                   "页面上找不到 composer 与发送按钮，无法判断生成状态（疑似 ChatGPT 改版）",
                   hint=f"人工看一眼 {job.get('conversation_url')}")
 
+        # composer 仍在不代表消息结构没变。旧锚点失效时曾连续 22 跳读到
+        # 0 字并假报 generating，而页面上的完整答案早已可见。
+        if not prog.get("has_messages") and not prog["generating"]:
+            try:
+                web.save_failed_page(page, d / job["id"])
+            except (cdp.CdpError, OSError):
+                pass
+            page.close()
+            _mark(d, job["id"], "ui_changed", "ui_changed",
+                  "定位失败：无法识别对话消息，不能把 0 字当作仍在生成",
+                  hint=f"人工看一眼 {job.get('conversation_url')}")
+
         # 「长度不变」只算一次微弱证据。连续两次都不变才承认它停了——
         # 单次相同区分不了「真结束」和「渲染临时停顿」，而 no_sentinel 是终态、误判就废掉这个作业。
         stalled_now = prog["len"] > 0 and prog["len"] == job.get("last_len", 0)

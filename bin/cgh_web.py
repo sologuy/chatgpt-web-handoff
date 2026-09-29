@@ -6,6 +6,7 @@
 - 发送后 URL 要等到服务端真 id，中间会短暂停在 /c/WEB:<临时id>
 """
 
+import base64
 import json
 import os
 import time
@@ -75,6 +76,34 @@ _EFFORT_BTN = """(() => {
 
 _PICKER = '[data-testid="composer-intelligence-picker-content"], [role="menu"]:has([role="slider"])'
 
+# 2026-09-29：新版移除了 data-message-author-role 与 article，但保留了
+# 无障碍说话人标题。必须按消息边界取正文，不能从 body 截字符串：用户提示词
+# 本身就带本轮哨兵，把它当助手回复会在生成前错误地判定完成。
+_MESSAGES_JS = r"""
+    const _messages = role => {
+        const name = role === 'assistant' ? /^(ChatGPT 说：|ChatGPT said:)$/
+                                         : /^(你说：|You said:)$/;
+        const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')]
+            .filter(h => name.test((h.getAttribute('aria-label') || h.textContent).trim()));
+        const modern = headings.filter(h => role === 'assistant'
+            ? h.getAttribute('data-conversation-role') === 'assistant'
+            : h.nextElementSibling?.querySelector('[data-user-message-bubble]'));
+        if (modern.length) return modern.map(h => role === 'assistant'
+            ? h.parentElement : h.nextElementSibling);
+        return [...document.querySelectorAll('[data-message-author-role="' + role + '"]')];
+    };
+    const _messageText = el => {
+        if (!el) return '';
+        const heading = el.firstElementChild;
+        if (heading?.getAttribute('data-conversation-role') === 'assistant') {
+            return [...el.children].filter(e => e !== heading)
+                .map(e => e.innerText).join('\n').trim();
+        }
+        return el.innerText;
+    };
+    const _messageCount = () => _messages('assistant').length + _messages('user').length;
+"""
+
 
 def _wait(page, expr, what, timeout=20, interval=0.3):
     deadline = time.time() + timeout
@@ -127,9 +156,9 @@ def _find_blank_chat(owned_ids=()):
         try:
             page = cdp.attach(p["id"])
             clean = page.evaluate(
-                "(() => document.querySelectorAll('[data-message-author-role]').length === 0"
+                "(() => {" + _MESSAGES_JS + " return _messageCount() === 0"
                 " && !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))"
-                " && (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')).innerText.trim() === '')()"
+                " && (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')).innerText.trim() === ''; })()"
             )
             if clean and (count_chips(page) or count_uploads(page)):
                 clean = False          # 有遗留附件或上传件，这页不能用
@@ -404,8 +433,8 @@ _TEXT_JS = r"""
 _PASTE_JS = """
     const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
     if (!el) return {ok: false, why: 'no_composer'};
-""" + _TEXT_JS + _CHIPS_JS + """
-    const before = document.querySelectorAll('[data-message-author-role]').length;
+""" + _TEXT_JS + _CHIPS_JS + _MESSAGES_JS + """
+    const before = _messageCount();
     const chips_before = chips();
     el.focus();
     if (ARG.clear) { document.execCommand('selectAll'); document.execCommand('delete'); }
@@ -442,7 +471,7 @@ _PASTE_JS = """
             inner_len: el.innerText.trim().length,
             chips_before: chips_before, chips_after: chips(),
             send_enabled: sendBtn ? !sendBtn.disabled : null,
-            msgs_delta: document.querySelectorAll('[data-message-author-role]').length - before};
+            msgs_delta: _messageCount() - before};
 """
 
 # 清残留附件：selectAll+delete 只清 composer，**清不掉附件**（2026-08-21 实测）。
@@ -658,11 +687,11 @@ def send(page, confirm=12):
     所以下面每一个「已发出去」的证据里都包含 stop 按钮的出现，
     只有全部证据都不成立、且 send 按钮还在，才允许换一种方式再点一次。
     """
-    _SENT_JS = """(() => {
+    _SENT_JS = "(() => {" + _MESSAGES_JS + """
         const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
         return JSON.stringify({
             len: el ? el.innerText.trim().length : -1,
-            users: document.querySelectorAll('[data-message-author-role=user]').length,
+            users: _messages('user').length,
             url: location.pathname,
             stop: !!document.querySelector('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]'),
             send: !!document.querySelector('[data-testid="send-button"], form button[aria-label="发送"], form button[aria-label="Send prompt"]')});
@@ -745,15 +774,17 @@ def wait_conversation_url(page, timeout=60):
 
 # ---------------------------------------------------------------- 读结果
 
-_PROGRESS_JS = """(() => {
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+_PROGRESS_JS = "(() => {" + _MESSAGES_JS + """
+  const a = _messages('assistant');
+  const u = _messages('user');
   const last = a[a.length - 1];
-  const t = last ? last.innerText : '';
+  const t = _messageText(last);
   return {
     url: location.href,
     generating: !!document.querySelector('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]'),
     assistant_msgs: a.length,
-    user_msgs: document.querySelectorAll('[data-message-author-role="user"]').length,
+    user_msgs: u.length,
+    has_messages: a.length + u.length > 0,
     // 结构探针：这两个锚点是「页面还是我们认识的样子」的证据。
     // 没有它们时，stop-button 缺失只能说明「选择器可能变了」，不能推出「生成完了」。
     has_composer: !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')),
@@ -763,15 +794,15 @@ _PROGRESS_JS = """(() => {
   };
 })()"""
 
-_FULL_JS = """(() => {
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+_FULL_JS = "(() => {" + _MESSAGES_JS + """
+  const a = _messages('assistant');
   const last = a[a.length - 1];
-  return last ? last.innerText : '';
+  return _messageText(last);
 })()"""
 
 
 def count_assistant(page):
-    return page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"]').length")
+    return page.evaluate("(() => {" + _MESSAGES_JS + " return _messages('assistant').length; })()")
 
 
 def wait_new_turn(page, before, timeout=90):
@@ -783,10 +814,8 @@ def wait_new_turn(page, before, timeout=90):
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        st = page.evaluate(
-            "(() => ({n: document.querySelectorAll('[data-message-author-role=\"assistant\"]').length,"
-            " gen: !!document.querySelector('[data-testid=\"stop-button\"], form button[aria-label*=\"停止\"], form button[aria-label*=\"Stop\"]')}))()")
-        if st["n"] > before or st["gen"]:
+        st = read_progress(page)
+        if st["assistant_msgs"] > before or st["generating"]:
             return st
         time.sleep(0.5)
     raise CdpError(f"发送后 {timeout}s 内没看到新回合（助手消息数仍为 {before}，也没有生成中标志）")
@@ -798,6 +827,14 @@ def read_progress(page):
 
 def read_full(page):
     return page.evaluate(_FULL_JS, timeout=120)
+
+
+def save_failed_page(page, directory):
+    snapshot = page.call('Accessibility.getFullAXTree', {})
+    (directory / 'failed-snapshot.txt').write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
+    shot = page.call('Page.captureScreenshot', {'format': 'webp'})
+    (directory / 'failed-page.webp').write_bytes(base64.b64decode(shot['data']))
 
 
 def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT):
@@ -819,7 +856,7 @@ def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT):
         guard_host(page)
         # 会话内容是异步渲染的。刚打开就读会拿到 0 条消息 + 无停止按钮，
         # 看起来跟「已完成但没输出」一模一样，会误判。
-        _wait(page, "document.querySelectorAll('[data-message-author-role]').length > 0",
+        _wait(page, "(() => {" + _MESSAGES_JS + " return _messageCount() > 0; })()",
               "会话消息渲染", timeout=timeout)
         _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout=timeout)
     except Exception:
