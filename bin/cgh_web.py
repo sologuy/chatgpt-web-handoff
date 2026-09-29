@@ -73,7 +73,7 @@ _EFFORT_BTN = """(() => {
   return btns.length ? btns[btns.length - 1] : null;
 })()"""
 
-_PICKER = '[data-testid="composer-intelligence-picker-content"]'
+_PICKER = '[data-testid="composer-intelligence-picker-content"], [role="menu"]:has([role="slider"])'
 
 
 def _wait(page, expr, what, timeout=20, interval=0.3):
@@ -97,7 +97,7 @@ def guard_host(page):
 
 def check_login(page):
     return page.evaluate(
-        "!/\\/auth|\\/login/.test(location.pathname) && !!document.querySelector('#prompt-textarea')"
+        "!/\\/auth|\\/login/.test(location.pathname) && !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))"
     )
 
 
@@ -128,8 +128,8 @@ def _find_blank_chat(owned_ids=()):
             page = cdp.attach(p["id"])
             clean = page.evaluate(
                 "(() => document.querySelectorAll('[data-message-author-role]').length === 0"
-                " && !!document.querySelector('#prompt-textarea')"
-                " && document.querySelector('#prompt-textarea').innerText.trim() === '')()"
+                " && !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))"
+                " && (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')).innerText.trim() === '')()"
             )
             if clean and (count_chips(page) or count_uploads(page)):
                 clean = False          # 有遗留附件或上传件，这页不能用
@@ -157,7 +157,7 @@ def open_new_chat(timeout=PAGE_TIMEOUT, owned_ids=()):
         # 主线程忙不会误判，反过来省掉后面每一次 evaluate 都要自己扛超时。
         page.unfreeze()
         guard_host(page)
-        _wait(page, "!!document.querySelector('#prompt-textarea')", "输入框就绪", timeout)
+        _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout)
         _wait(page, f"(() => {{ const b = {_EFFORT_BTN}; return !!b && b.getBoundingClientRect().width > 0; }})()",
               "档位按钮就绪", timeout)
         if not check_login(page):
@@ -203,7 +203,7 @@ _SLIDER_CTRL = f"""(() => {{
   const g = document.querySelector('{_PICKER}');
   if (!g) return null;
   return [...g.querySelectorAll('[role=menuitem]')]
-    .find(e => /^(能力|Capability)$/i.test(e.getAttribute('aria-label') || '')) || null;
+    .find(e => /^(能力|强度|Capability|Intensity|Effort)$/i.test(e.getAttribute('aria-label') || '')) || null;
 }})()"""
 
 # 当前档位读 aria-describedby 指向的实时描述：「极高，第 4 项，共 5 项。」
@@ -213,7 +213,7 @@ _EFFORT_STATE = f"""(() => {{
   if (!g) return null;
   const s = g.querySelector('[role=slider]');
   const c = [...g.querySelectorAll('[role=menuitem]')]
-    .find(e => /^(能力|Capability)$/i.test(e.getAttribute('aria-label') || ''));
+    .find(e => /^(能力|强度|Capability|Intensity|Effort)$/i.test(e.getAttribute('aria-label') || ''));
   const ids = c ? (c.getAttribute('aria-describedby') || '').split(/\\s+/) : [];
   const txt = ids.map(i => (document.getElementById(i) || {{}}).innerText || '').join(' ');
   const m = txt.match(/^\\s*([^，,]+)[，,]\\s*第\\s*(\\d+)\\s*项/)
@@ -368,7 +368,7 @@ _CHIPS_JS = """
     // 输入框可能还没渲染出来（续聊时接上已有对话页尤其常见）。
     // 不判空的话这里直接抛 TypeError: ... reading 'closest'，
     // 而调用方看到的是一个跟 DOM 完全不沾边的报错，很难往「页面没加载完」上想。
-    const _composer = document.querySelector('#prompt-textarea');
+    const _composer = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
     const _form = (_composer && _composer.closest('form')) || document.body;
     const _hit = e => /在文本字段中显示|Show in text field/.test(e.textContent);
     const chips = () => [..._form.querySelectorAll('*')]
@@ -383,7 +383,7 @@ _CHIPS_JS = """
 # 另外整段正文只落在一个 <p> 里，换行是 <br>，所以不能按段落切。
 _TEXT_JS = r"""
     const _logical = () => {
-        const el = document.querySelector('#prompt-textarea');
+        const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
         if (!el) return '';
         const out = [];
         const walk = n => {
@@ -402,7 +402,7 @@ _TEXT_JS = r"""
 """
 
 _PASTE_JS = """
-    const el = document.querySelector('#prompt-textarea');
+    const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
     if (!el) return {ok: false, why: 'no_composer'};
 """ + _TEXT_JS + _CHIPS_JS + """
     const before = document.querySelectorAll('[data-message-author-role]').length;
@@ -412,6 +412,16 @@ _PASTE_JS = """
     const dt = new DataTransfer();
     dt.setData('text/plain', ARG.text);
     el.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true}));
+    // 2026-09-28 新版 composer（ProseMirror、无 #prompt-textarea）不吃合成 paste 事件：
+    // 粘贴后仍是空的、也没转成附件，就改用原生 insertText，逐行插入、换行走 insertParagraph。
+    await new Promise(r => setTimeout(r, 400));
+    if (_logical().trim().length === 0 && chips() === chips_before) {
+        el.focus();
+        ARG.text.split('\\n').forEach((ln, i) => {
+            if (i) document.execCommand('insertParagraph');
+            if (ln) document.execCommand('insertText', false, ln);
+        });
+    }
 
     // 不是 sleep 后拍一张照：超长正文转附件要走「清空 composer → 建附件 → chip 出现 →
     // 可发送」好几步，固定等待会采样到中间态。这里轮询到形态稳定为止。
@@ -427,7 +437,7 @@ _PASTE_JS = """
         } else { stable = 0; }
         last = now;
     }
-    const sendBtn = document.querySelector('[data-testid="send-button"]');
+    const sendBtn = document.querySelector('[data-testid="send-button"], form button[aria-label="发送"], form button[aria-label="Send prompt"]');
     return {ok: true, len: _logical().trim().length,
             inner_len: el.innerText.trim().length,
             chips_before: chips_before, chips_after: chips(),
@@ -439,7 +449,7 @@ _PASTE_JS = """
 # 附件卡片上没有移除键，唯一的出路是点「在文本字段中显示」把它还原成内联文本再删。
 _DROP_CHIPS_JS = """
 """ + _TEXT_JS + _CHIPS_JS + """
-    const el = document.querySelector('#prompt-textarea');
+    const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
     if (!el) return {chips: chips(), composer: -1, why: 'no_composer'};
     for (let i = 0; i < 6 && chips() > 0; i++) {
         const btn = [..._form.querySelectorAll('button,[role=button]')].find(
@@ -465,9 +475,9 @@ _DROP_CHIPS_JS = """
 # 卡片本身只有 tailwind 生成的 class，改版必变，不能用。
 _UPLOADS_JS = """
     const _upBtns = () => [...document.querySelectorAll('button,[role=button]')]
-        .filter(b => /^(移除文件|Remove file)/.test(b.getAttribute('aria-label') || ''));
+        .filter(b => /^(移除文件|Remove file|移除[“"]|Remove [“"])/.test(b.getAttribute('aria-label') || ''));
     const _upNames = () => _upBtns().map(
-        b => (b.getAttribute('aria-label') || '').replace(/^(移除文件|Remove file)\s*\d*\s*[:：]\s*/, ''));
+        b => (b.getAttribute('aria-label') || '').replace(/^(移除文件|Remove file)\s*\d*\s*[:：]\s*/, '').replace(/^(移除|Remove)\s*[“"]/, '').replace(/[”"]$/, ''));
     // 注意：卡片里那个转圈**不能**当就绪判据。实测它在上传完成之后才出现
     // （卡片先转圈消失 →3s→ 又回来），而且长期不消失；带着它按发送照样能发出去
     // （实测 1s 拿到 URL）。它是上传完成后的二次处理指示，不是「还没传完」。
@@ -649,13 +659,13 @@ def send(page, confirm=12):
     只有全部证据都不成立、且 send 按钮还在，才允许换一种方式再点一次。
     """
     _SENT_JS = """(() => {
-        const el = document.querySelector('#prompt-textarea');
+        const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
         return JSON.stringify({
             len: el ? el.innerText.trim().length : -1,
             users: document.querySelectorAll('[data-message-author-role=user]').length,
             url: location.pathname,
-            stop: !!document.querySelector('[data-testid="stop-button"]'),
-            send: !!document.querySelector('[data-testid="send-button"]')});
+            stop: !!document.querySelector('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]'),
+            send: !!document.querySelector('[data-testid="send-button"], form button[aria-label="发送"], form button[aria-label="Send prompt"]')});
     })()"""
 
     # 判据一律跟点击前的基线比，不能用绝对值：续聊时 URL 本来就是 /c/...、
@@ -671,7 +681,7 @@ def send(page, confirm=12):
                 or st["users"] > base["users"]
                 or (st["stop"] and not base["stop"])
                 or (base["send"] and not st["send"]))
-    page.click_js("document.querySelector('[data-testid=\"send-button\"]')", "发送按钮")
+    page.click_js("document.querySelector('[data-testid=\"send-button\"], form button[aria-label=\"发送\"], form button[aria-label=\"Send prompt\"]')", "发送按钮")
     if before <= 0:
         return                      # 输入框本来就空，验不了，也就不敢重试
 
@@ -706,7 +716,7 @@ def send(page, confirm=12):
     # 用 cdp 里那套完整指针序列，**不要用裸 el.click()**：ChatGPT 的按钮是
     # React 组件，行为绑在 pointerdown/mousedown 上，只发一个 click 事件不触发。
     # 这里用选择器当场重新定位，绝不用之前那次的坐标（那个位置现在可能是 stop）。
-    page.evaluate("(() => { const b = document.querySelector('[data-testid=\"send-button\"]');"
+    page.evaluate("(() => { const b = document.querySelector('[data-testid=\"send-button\"], form button[aria-label=\"发送\"], form button[aria-label=\"Send prompt\"]');"
                   f" return b ? {cdp.Page._JS_CLICK}(b) : false; }})()", timeout=20)
     ok, st = _wait(confirm)
     if ok:
@@ -741,13 +751,13 @@ _PROGRESS_JS = """(() => {
   const t = last ? last.innerText : '';
   return {
     url: location.href,
-    generating: !!document.querySelector('[data-testid="stop-button"]'),
+    generating: !!document.querySelector('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]'),
     assistant_msgs: a.length,
     user_msgs: document.querySelectorAll('[data-message-author-role="user"]').length,
     // 结构探针：这两个锚点是「页面还是我们认识的样子」的证据。
     // 没有它们时，stop-button 缺失只能说明「选择器可能变了」，不能推出「生成完了」。
-    has_composer: !!document.querySelector('#prompt-textarea'),
-    has_send_btn: !!document.querySelector('[data-testid="send-button"]'),
+    has_composer: !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')),
+    has_send_btn: !!document.querySelector('[data-testid="send-button"], form button[aria-label="发送"], form button[aria-label="Send prompt"]'),
     len: t.length,
     tail: t.slice(-1200),
   };
@@ -775,7 +785,7 @@ def wait_new_turn(page, before, timeout=90):
     while time.time() < deadline:
         st = page.evaluate(
             "(() => ({n: document.querySelectorAll('[data-message-author-role=\"assistant\"]').length,"
-            " gen: !!document.querySelector('[data-testid=\"stop-button\"]')}))()")
+            " gen: !!document.querySelector('[data-testid=\"stop-button\"], form button[aria-label*=\"停止\"], form button[aria-label*=\"Stop\"]')}))()")
         if st["n"] > before or st["gen"]:
             return st
         time.sleep(0.5)
@@ -798,7 +808,7 @@ def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT):
             guard_host(page)
             # 复用的标签页也要确认输入框在——它可能刚被导航走又回来，
             # 或者页面还在重建。不等就会在后面注入时撞上空的 composer。
-            _wait(page, "!!document.querySelector('#prompt-textarea')", "输入框就绪", timeout)
+            _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout)
             return page, page_id, False
         except CdpError:
             pass
@@ -811,7 +821,7 @@ def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT):
         # 看起来跟「已完成但没输出」一模一样，会误判。
         _wait(page, "document.querySelectorAll('[data-message-author-role]').length > 0",
               "会话消息渲染", timeout=timeout)
-        _wait(page, "!!document.querySelector('#prompt-textarea')", "输入框就绪", timeout=timeout)
+        _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout=timeout)
     except Exception:
         page.close()          # 只断 WS，标签页留着给人看现场
         raise
