@@ -187,7 +187,7 @@ $CGH stats                                   # 跨仓统计（档位性价比 / 
 $CGH backfill                                # 把本仓库已有作业补进全机账本（幂等）
 ```
 
-模型固定 `GPT-5.6 Sol`，每次 submit 都会实测回读。本 Skill 只调推理强度，不切模型。
+模型必须在 `bin/cgh_web.py` 的 `EXPECTED_MODELS` 允许列表内（当前包含 `GPT-6`），每次 submit 都会实测回读。本 Skill 只调推理强度，不切模型。
 
 **并发**：作业闸门是按仓库算的，不同仓库可以同时跑，互不阻塞。
 但 ChatGPT 的推理强度是账号级共享偏好，所以 `cgh` 在「设档位 → 发送」这一两秒上加了全机互斥。
@@ -205,7 +205,7 @@ $CGH backfill                                # 把本仓库已有作业补进全
 | `remote_debug_denied` | 连不上 9222 | 提示 `open -a "Google Chrome" --args --remote-debugging-port=9222`，**不要擅自重启用户的 Chrome** |
 | `auth_required` | ChatGPT 未登录 | 请用户在浏览器里登录后重试 |
 | `effort_not_found` | 档位标签对不上（通常是界面语言变了） | 把 `effort_available` 里的实际选项列给用户，让他选 |
-| `model_changed` | 模型不是钉死的那个 | 报出实测模型名。确认要跟进就改 `bin/cgh_web.py` 的 `EXPECTED_MODEL` |
+| `model_changed` | 模型不在允许列表内 | 报出实测模型名。确认要跟进就改 `bin/cgh_web.py` 的 `EXPECTED_MODELS` |
 | `wrong_page` | 目标页不是 chatgpt.com | 直接报告，不要试探 |
 | `ui_changed` | 元素定位失败 / 等待超时 | ChatGPT 改版了，报告并停下 |
 | `ui_changed` + `background_unfreeze_failed` | 后台标签页解冻失效 | 不是改版。报告 Chrome 版本，别重试——页面已停止渲染，读到的都是旧值 |

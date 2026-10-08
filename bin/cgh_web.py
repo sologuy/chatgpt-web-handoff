@@ -24,8 +24,9 @@ CHATGPT_HOSTS = {"chatgpt.com", "chat.openai.com"}
 # 不是具体模型名。所以这里从「钉死一个名字」改成「一组允许的选中项」：
 # 仍然能发现「账号被切到别的模型」，但不会因为官方把默认项改成别名就每次都拦。
 # 实测到的原值照旧记进 job.json，审计链不受影响。
+# 2026-10-08 实测当前选中项为 GPT-6，经用户确认纳入允许列表。
 EXPECTED_MODELS = [x.strip() for x in
-                   os.environ.get("CGH_EXPECTED_MODEL", "最新,Latest,GPT-5.6 Sol").split(",")
+                   os.environ.get("CGH_EXPECTED_MODEL", "最新,Latest,GPT-5.6 Sol,GPT-6").split(",")
                    if x.strip()]
 EXPECTED_MODEL = EXPECTED_MODELS[0]          # 报错文案用
 
@@ -38,7 +39,7 @@ EXPECTED_MODEL = EXPECTED_MODELS[0]          # 报错文案用
 PAGE_TIMEOUT = int(os.environ.get("CGH_PAGE_TIMEOUT", "150"))
 
 # 每档的标签候选。中文项是 2026-08-19 实测（界面语言 zh-CN）；
-# 英文项未实测，只作候选——命中不了照样置 effort_not_found 停下问人，不静默降级。
+# 2026-10-08 实测英文五档 Instant / Medium / High / Extra High / Pro；其他别名仍只作候选。
 # 首项是"想要的那个"，用于日志与回读比对。
 EFFORT_LABELS = {
     "instant": ["即时", "极速", "Instant"],
@@ -67,11 +68,24 @@ class EffortNotFound(CdpError):
 # ---------------------------------------------------------------- JS 片段
 
 _EFFORT_BTN = """(() => {
+  const visible = b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  // 2026-10-08：对话页保留隐藏的首页 form；先按无障碍名称找可见按钮。
+  const named = [...document.querySelectorAll('button,[role="button"]')].find(b =>
+    /^(选择 ChatGPT 模型|Choose ChatGPT model|Select ChatGPT model)$/.test(b.getAttribute('aria-label') || '') && visible(b));
+  if (named) return named;
   const form = document.querySelector('form');
   if (!form) return null;
   const btns = [...form.querySelectorAll('button[aria-haspopup="menu"]')]
-    .filter(b => b.getAttribute('data-testid') !== 'composer-plus-btn');
+    .filter(b => b.getAttribute('data-testid') !== 'composer-plus-btn' && visible(b));
   return btns.length ? btns[btns.length - 1] : null;
+})()"""
+
+_SEND_BTN = """(() => {
+  // 与档位按钮一样，先排除隐藏首页 form 中的同名发送按钮。
+  const visible = b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const named = [...document.querySelectorAll('button,[role="button"]')].find(b =>
+    /^(发送|Send prompt)$/.test(b.getAttribute('aria-label') || '') && visible(b));
+  return named || [...document.querySelectorAll('[data-testid="send-button"]')].find(visible) || null;
 })()"""
 
 _PICKER = '[data-testid="composer-intelligence-picker-content"], [role="menu"]:has([role="slider"])'
@@ -466,7 +480,7 @@ _PASTE_JS = """
         } else { stable = 0; }
         last = now;
     }
-    const sendBtn = document.querySelector('[data-testid="send-button"], form button[aria-label="发送"], form button[aria-label="Send prompt"]');
+    const sendBtn = """ + _SEND_BTN + """;
     return {ok: true, len: _logical().trim().length,
             inner_len: el.innerText.trim().length,
             chips_before: chips_before, chips_after: chips(),
@@ -694,7 +708,7 @@ def send(page, confirm=12):
             users: _messages('user').length,
             url: location.pathname,
             stop: !!document.querySelector('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]'),
-            send: !!document.querySelector('[data-testid="send-button"], form button[aria-label="发送"], form button[aria-label="Send prompt"]')});
+            send: !!(""" + _SEND_BTN + """)});
     })()"""
 
     # 判据一律跟点击前的基线比，不能用绝对值：续聊时 URL 本来就是 /c/...、
@@ -710,7 +724,7 @@ def send(page, confirm=12):
                 or st["users"] > base["users"]
                 or (st["stop"] and not base["stop"])
                 or (base["send"] and not st["send"]))
-    page.click_js("document.querySelector('[data-testid=\"send-button\"], form button[aria-label=\"发送\"], form button[aria-label=\"Send prompt\"]')", "发送按钮")
+    page.click_js(_SEND_BTN, "发送按钮")
     if before <= 0:
         return                      # 输入框本来就空，验不了，也就不敢重试
 
@@ -745,7 +759,7 @@ def send(page, confirm=12):
     # 用 cdp 里那套完整指针序列，**不要用裸 el.click()**：ChatGPT 的按钮是
     # React 组件，行为绑在 pointerdown/mousedown 上，只发一个 click 事件不触发。
     # 这里用选择器当场重新定位，绝不用之前那次的坐标（那个位置现在可能是 stop）。
-    page.evaluate("(() => { const b = document.querySelector('[data-testid=\"send-button\"], form button[aria-label=\"发送\"], form button[aria-label=\"Send prompt\"]');"
+    page.evaluate("(() => { const b = " + _SEND_BTN + ";"
                   f" return b ? {cdp.Page._JS_CLICK}(b) : false; }})()", timeout=20)
     ok, st = _wait(confirm)
     if ok:
@@ -788,7 +802,7 @@ _PROGRESS_JS = "(() => {" + _MESSAGES_JS + """
     // 结构探针：这两个锚点是「页面还是我们认识的样子」的证据。
     // 没有它们时，stop-button 缺失只能说明「选择器可能变了」，不能推出「生成完了」。
     has_composer: !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')),
-    has_send_btn: !!document.querySelector('[data-testid="send-button"], form button[aria-label="发送"], form button[aria-label="Send prompt"]'),
+    has_send_btn: !!(""" + _SEND_BTN + """),
     len: t.length,
     tail: t.slice(-1200),
   };
