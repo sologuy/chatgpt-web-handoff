@@ -516,11 +516,13 @@ _DROP_CHIPS_JS = """
 # 锚点用每张卡片上的移除按钮：aria-label 形如「移除文件1：a.png」
 # （英文界面是 Remove file 1: ...）。这是定位优先级①的 a11y name；
 # 卡片本身只有 tailwind 生成的 class，改版必变，不能用。
+# 2026-10-10 实测新版改成「移除 a.docx」（空格 + 文件名、无引号），按带扩展名的文件名认。
 _UPLOADS_JS = """
     const _upBtns = () => [...document.querySelectorAll('button,[role=button]')]
-        .filter(b => /^(移除文件|Remove file|移除[“"]|Remove [“"])/.test(b.getAttribute('aria-label') || ''));
+        .filter(b => /^(移除文件|Remove file|移除[“"]|Remove [“"])/.test(b.getAttribute('aria-label') || '')
+                  || /^(移除|Remove) .+\\.[A-Za-z0-9]{1,8}$/.test(b.getAttribute('aria-label') || ''));
     const _upNames = () => _upBtns().map(
-        b => (b.getAttribute('aria-label') || '').replace(/^(移除文件|Remove file)\s*\d*\s*[:：]\s*/, '').replace(/^(移除|Remove)\s*[“"]/, '').replace(/[”"]$/, ''));
+        b => (b.getAttribute('aria-label') || '').replace(/^(移除文件|Remove file)\s*\d*\s*[:：]\s*/, '').replace(/^(移除|Remove)\s*[“"]/, '').replace(/[”"]$/, '').replace(/^(移除|Remove) /, ''));
     // 注意：卡片里那个转圈**不能**当就绪判据。实测它在上传完成之后才出现
     // （卡片先转圈消失 →3s→ 又回来），而且长期不消失；带着它按发送照样能发出去
     // （实测 1s 拿到 URL）。它是上传完成后的二次处理指示，不是「还没传完」。
