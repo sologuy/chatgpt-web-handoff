@@ -348,16 +348,17 @@ class Page(Session):
         overflow:clip 裁掉，此时元素照样有非零 rect，但那个坐标上最上层是菜单
         底下的页面。照着点既点不到目标，还会把菜单点关。所以必须做命中测试。
         """
-        # 只在元素确实在视口外时才 scrollIntoView。无条件滚会把下拉菜单
+        # 只在目标中心确实在视口外时才 scrollIntoView。无条件滚会把下拉菜单
         # （overflow:auto 的小容器）滚得每次探测都换位置，坐标永远稳定不下来。
         return self.evaluate(
             "(() => { const el = (" + finder_js + "); if (!el) return null;"
             " let r = el.getBoundingClientRect();"
-            " if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) {"
+            " if (r.top + r.height/2 < 0 || r.top + r.height/2 >= innerHeight"
+            " || r.left + r.width/2 < 0 || r.left + r.width/2 >= innerWidth) {"
             "   el.scrollIntoView({block:'center'}); r = el.getBoundingClientRect(); }"
             " if (!r.width || !r.height) return null;"
             " const x = r.left + r.width/2, y = r.top + r.height/2;"
-            " if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return null;"
+            " if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;"
             " const top = document.elementFromPoint(x, y);"
             " if (!top || !(top === el || el.contains(top))) return null;"
             " return {x, y}; })()"
