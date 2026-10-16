@@ -162,6 +162,8 @@ $CGH outcome --id <job_id> --status adopted|partial|rejected \
 
 ```bash
 $CGH continue --from <上一轮的 job_id> -- <这轮要追问什么>
+# 本轮补充原文或图片（最多10个，只上传本轮指定文件）：
+$CGH continue --from <上一轮的 job_id> --attach ./supplement.pdf -- <这轮要追问什么>
 # 然后照常填 request.md，再 $CGH submit --id <新 job_id>
 ```
 
@@ -170,6 +172,7 @@ $CGH continue --from <上一轮的 job_id> -- <这轮要追问什么>
 - 每次追问建一个**子作业**（自己的 job_id / request.md / result.md / 哨兵），
   用 `parent_id` 串成链。这样每一轮的裁决都留得下，不会被下一轮覆盖。
 - 档位默认继承父作业；追问内容里点了别的档位就按它。
+- `--attach`沿用新建作业的路径、数量及上传校验；不重复上传父轮附件。补充上下文须说明新增附件的阅读任务。
 - 父作业必须已有 `conversation_url`（即至少提交过一次）。
 
 ## 其他命令

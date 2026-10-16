@@ -584,6 +584,7 @@ def cmd_continue(a):
             die("busy", "已有活跃作业，V1.0 限制单作业并发",
                 active_id=busy["id"], active_status=busy["status"],
                 hint=f"cgh abort --id {busy['id']}")
+        attachments = _resolve_attachments(getattr(a, "attach", None))
         gi = ensure_gitignored(root, d)
         job_id = new_id()
         jd = d / job_id
@@ -591,6 +592,7 @@ def cmd_continue(a):
         job = {
             "id": job_id, "schema_version": SCHEMA_VERSION, "status": "created",
             "action": parent["action"], "subject": subject,
+            "attachments": attachments,
             "parent_id": parent["id"], "continue_from": parent["conversation_url"],
             "turns_before": None,
             "effort_requested": effort, "effort_source": effort_source,
@@ -1651,6 +1653,8 @@ def main():
     s = sub.add_parser("continue", help="在既有对话里追问：建子作业，复用父作业的 ChatGPT 会话")
     s.add_argument("--from", dest="parent", required=True, help="父作业 job_id")
     s.add_argument("--effort", help="默认继承父作业；追问内容里点了档位则以它为准")
+    s.add_argument("--attach", action="append", metavar="路径",
+                   help="本轮新增附件，可重复，最多10个；不重新上传父作业附件")
     s.add_argument("--force", action="store_true")
     s.add_argument("instruction", nargs=argparse.REMAINDER,
                    help="`--` 之后原样照抄用户的追问，不要复述")

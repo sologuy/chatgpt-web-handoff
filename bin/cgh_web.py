@@ -528,11 +528,15 @@ _UPLOADS_JS = """
     // （实测 1s 拿到 URL）。它是上传完成后的二次处理指示，不是「还没传完」。
 """
 
-# 文件输入框：ChatGPT 有三个 input[type=file]，#upload-photos / #upload-camera
-# 限 image/*，只有通吃的那个 accept 为空。挑 accept 最宽的那个——这样支持什么
-# 由 ChatGPT 服务端决定，我们不自己维护一张类型白名单。
-_FILE_INPUT = ("[...document.querySelectorAll('input[type=file]')]"
-               ".sort((a, b) => (a.accept ? 1 : 0) - (b.accept ? 1 : 0))[0]")
+# 续聊页会保留另一份隐藏 form；全页第一个通用文件框可能属于它，上传后没有卡片。
+# 只取实际 composer 所属 form，再挑 accept 最宽的文件框，不维护类型白名单。
+_FILE_INPUT = """(() => {
+    const composer = document.querySelector('#prompt-textarea') ||
+        document.querySelector('div.ProseMirror[contenteditable=true]');
+    const form = composer && composer.closest('form');
+    return form ? [...form.querySelectorAll('input[type=file]')]
+        .sort((a, b) => (a.accept ? 1 : 0) - (b.accept ? 1 : 0))[0] : null;
+})()"""
 
 MAX_ATTACHMENTS = 10          # ChatGPT 单条消息的上限，先拦住免得白等一场
 
