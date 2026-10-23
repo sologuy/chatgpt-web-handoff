@@ -30,6 +30,7 @@ import secrets
 import subprocess
 import time
 import unicodedata
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -347,29 +348,41 @@ def detect_origin(root):
     return o
 
 
+def _ledger_record(ev, root, job, **extra):
+    origin = job.get("origin") or {}
+    rec = {"ts": extra.pop("ts_override", None) or now(), "ev": ev, "repo": str(root), "id": job.get("id"),
+           "harness": origin.get("harness"), "session_id": origin.get("session_id"),
+           "action": job.get("action"), "subject": job.get("subject"),
+           "effort_requested": job.get("effort_requested"),
+           "effort_actual": job.get("effort_actual"),
+           "parent_id": job.get("parent_id"),
+           "conversation_url": job.get("conversation_url")}
+    rec.update(extra)
+    return rec
+
+
+def _write_ledger(f, rec):
+    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    f.flush()                       # 必须在仍持锁时写出缓冲，不能先解锁再等 close
+
+
 def ledger_append(ev, root, job, **extra):
     """全机账本。作业散在各使用方仓库里，没有这个就没有跨仓视图。
 
     append-only + flock —— 多仓库并发是本项目明确支持的场景，不能互相踩。
-    账本写失败绝不能影响 handoff 本身，所以整段吞异常。
+    账本写失败告警并返回 False，但不能让已发送的 handoff 被误判成需要重投。
     """
     try:
-        origin = job.get("origin") or {}
-        rec = {"ts": extra.pop("ts_override", None) or now(), "ev": ev, "repo": str(root), "id": job.get("id"),
-               "harness": origin.get("harness"), "session_id": origin.get("session_id"),
-               "action": job.get("action"), "subject": job.get("subject"),
-               "effort_requested": job.get("effort_requested"),
-               "effort_actual": job.get("effort_actual"),
-               "parent_id": job.get("parent_id"),
-               "conversation_url": job.get("conversation_url")}
-        rec.update(extra)
+        rec = _ledger_record(ev, root, job, **extra)
         LEDGER.parent.mkdir(parents=True, exist_ok=True)
         with open(LEDGER, "a", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        pass
+            _write_ledger(f, rec)
+        return True
+    except Exception as exc:
+        print(f"cgh: ledger_write_failed: {LEDGER} ({type(exc).__name__}); "
+              f"id={job.get('id')} ev={ev}，handoff 状态不受影响，请核对后补漏", file=sys.stderr)
+        return False
 
 
 def root_of(d):
@@ -1544,11 +1557,12 @@ def _short(path):
     return t if len(parts) <= 4 else ".../" + "/".join(parts[-2:])
 
 
-def _read_ledger():
-    if not LEDGER.exists():
+def _read_ledger(stream=None):
+    if stream is None and not LEDGER.exists():
         return []
     out = []
-    for ln in LEDGER.read_text(encoding="utf-8").splitlines():
+    lines = stream if stream is not None else LEDGER.read_text(encoding="utf-8").splitlines()
+    for ln in lines:
         ln = ln.strip()
         if not ln:
             continue
@@ -1581,6 +1595,7 @@ def _count(pairs):
 
 def cmd_stats(a):
     jobs = _by_job(_read_ledger())
+    read_at = now()
     if not jobs:
         die("empty_ledger", f"账本还是空的：{LEDGER}",
             hint="跑过 cgh new 之后才会有记录")
@@ -1588,11 +1603,17 @@ def cmd_stats(a):
     # 但它没有裁决/置信度这些维度，混进下面的表只会把分母做大，所以先摘出去单列。
     imgs = {i: j for i, j in jobs.items() if j.get("action") == "image"}
     jobs = {i: j for i, j in jobs.items() if i not in imgs}
-    if a.json:
-        ok(ledger=str(LEDGER), jobs=len(jobs), detail=jobs, images=imgs)
-
     done = {i: j for i, j in jobs.items() if "completed" in j["evs"]}
-    print(f"账本 {LEDGER}    作业 {len(jobs)} 个，出结果 {len(done)} 个")
+    oc = {i: j["evs"]["outcome"] for i, j in jobs.items() if "outcome" in j["evs"]}
+    unjudged = len(done.keys() - oc.keys())
+    if a.json:
+        ok(ledger=str(LEDGER), scope="ledger", read_at=read_at,
+           jobs=len(jobs), detail=jobs, images=imgs,
+           summary={"completed": len(done), "outcomes": len(oc),
+                    "completed_with_outcome": len(done.keys() & oc.keys()),
+                    "unjudged": unjudged})
+        return
+    print(f"账本 {LEDGER}    作业 {len(jobs)} 个，出结果 {len(done)} 个（账本口径，读取于 {read_at}）")
 
     _table("按仓库", ["仓库", "作业", "完成"],
            [[_short(r), str(n), str(sum(1 for i, j in done.items() if j.get("repo") == r))]
@@ -1626,7 +1647,6 @@ def cmd_stats(a):
             sorted(_count(j.get("action") for j in jobs.values()).items(),
                    key=lambda kv: -kv[1])])
 
-    oc = {i: j["evs"]["outcome"] for i, j in jobs.items() if "outcome" in j["evs"]}
     if oc:
         _table("结论的下场（进化燃料）", ["处置", "条数"],
                [[OUTCOMES.get(k, str(k)), str(v)] for k, v in
@@ -1640,50 +1660,101 @@ def cmd_stats(a):
                [[str(len(imgs)), str(good),
                  " ".join(f"{k}:{v}" for k, v in sorted(errs.items())) or "-"]])
 
-    unjudged = len(done) - len(oc)
     if unjudged > 0:
         print(f"\n⚠️  {unjudged} 个作业出了结果但没记下场——"
               f"这部分对进化是浪费的（cgh outcome --id <id> --status ...）")
 
 
+def _backfill_completed(jd, job):
+    if job.get("status") != "completed" or not job.get("completed_at"):
+        raise ValueError("作业不是有完成时间的 completed")
+    if not job.get("result_file"):
+        raise ValueError("result_file 为空")
+    rf = jd / job["result_file"]
+    if rf.is_symlink() or not rf.is_file() or rf.resolve().parent != jd.resolve():
+        raise ValueError("结果路径不是本作业目录内的普通文件")
+    parsed, err = parse_sentinel(rf.read_text(encoding="utf-8"), job["id"])
+    if err:
+        raise ValueError("结果文件未通过本作业哨兵解析")
+    raw = jd / "raw-last-message.txt"
+    if raw.exists() or raw.is_symlink():
+        if raw.is_symlink() or not raw.is_file():
+            raise ValueError("原始回答路径不是普通文件")
+        original, err = parse_sentinel(raw.read_text(encoding="utf-8"), job["id"])
+        if err or original != parsed:
+            raise ValueError("原始回答与结果文件解析不一致")
+    return {"verdict": parsed["verdict"], "confidence": parsed["confidence"],
+            "findings": len(parsed["findings"]),
+            "recommended_actions": len(parsed["recommended_actions"])}
+
+
 def cmd_backfill(a):
-    """把已有作业补进账本。幂等：账本里已有的 id 跳过。
-
-    不补的话 L3 要攒几个月才有统计价值，而历史作业本身就是最好的样本。
-    补出来的记录只有 created/completed 两类事件，时间戳取 job.json 里的原值。
-    """
-    d = handoffs_dir(repo_root(a.root))
-    known = {r.get("id") for r in _read_ledger()}
-    added, skipped = [], 0
-    for f in sorted(d.glob("*/job.json")):
-        job = json.loads(f.read_text(encoding="utf-8"))
-        if job["id"] in known:
-            skipped += 1
-            continue
-        job.setdefault("origin", {"harness": "backfill"})
-        ledger_append("created", root_of(d), job, ts_override=job.get("created_at"))
-        rf = f.parent / (job.get("result_file") or "")
-        if job.get("completed_at") and rf.exists():
-            v = _verdict_of(rf)
-            ledger_append("completed", root_of(d), job, ts_override=job["completed_at"], **v)
-        added.append(job["id"])
-    ok(backfilled=len(added), skipped=skipped, ledger=str(LEDGER), ids=added)
-
-
-def _verdict_of(result_file):
-    """从已生成的 result.md 里抠出裁决，供回填用。"""
-    out = {}
+    """只补缺失的 created/completed 事件；检查和追加共用账本锁，不覆盖原件。"""
+    root = repo_root(a.root)
+    # 预览也不能触发旧目录迁移；这里只读现有产物路径。
+    d = root.joinpath(*ARTIFACT_DIR)
+    if not d.exists():
+        d = root.joinpath(*LEGACY_DIR)
+    wanted = set(a.ids or [])
+    if any(not ID_RE.fullmatch(i) for i in wanted):
+        die("bad_id", "--id 中有不合法的 job_id")
+    events = set(a.events or ["created", "completed"])
+    added, planned, rejected, skipped = [], [], [], 0
+    selected = [d / i / "job.json" for i in sorted(wanted)] if wanted else sorted(d.glob("*/job.json"))
     try:
-        for ln in result_file.read_text(encoding="utf-8").splitlines():
-            for k, cast in (("verdict", str), ("confidence", float)):
-                if ln.startswith(f"{k}:") and k not in out:
+        if not a.dry_run:
+            LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        opened = (LEDGER.open("r" if a.dry_run else "a+", encoding="utf-8")
+                  if not a.dry_run or LEDGER.exists() else nullcontext(None))
+        with opened as ledger:
+            if ledger is not None:
+                fcntl.flock(ledger.fileno(), fcntl.LOCK_SH if a.dry_run else fcntl.LOCK_EX)
+                ledger.seek(0)
+            known = {(r.get("id"), r.get("ev")) for r in _read_ledger(ledger)} if ledger else set()
+            for f in selected:
+                try:
+                    job = json.loads(f.read_text(encoding="utf-8"))
+                    if job.get("id") != f.parent.name or not ID_RE.fullmatch(job["id"]):
+                        raise ValueError("job_id 与目录不一致或格式非法")
+                except (OSError, ValueError, TypeError, AttributeError) as exc:
+                    rejected.append({"id": f.parent.name, "ev": None, "reason": type(exc).__name__})
+                    continue
+                # 默认扫描只核对有完成痕迹的作业；显式点名时仍给出拒绝原因。
+                check_completed = (wanted or (a.events and "completed" in a.events)
+                                   or job.get("status") in SUCCESS_TERMINAL
+                                   or job.get("completed_at") or job.get("result_file"))
+                pending = [ev for ev in ("created", "completed") if ev in events
+                           and (ev != "completed" or check_completed)
+                           and (job["id"], ev) not in known]
+                if not pending:
+                    skipped += 1
+                for ev in pending:
                     try:
-                        out[k] = cast(ln.split(":", 1)[1].strip())
-                    except ValueError:
-                        pass
-    except Exception:
-        pass
-    return out
+                        ts = job.get("created_at" if ev == "created" else "completed_at")
+                        extra = _backfill_completed(f.parent, job) if ev == "completed" else {}
+                        if not ts:
+                            raise ValueError("原始事件时间为空")
+                        rec = _ledger_record(ev, root, job, ts_override=ts, via="backfill", **extra)
+                    except ValueError as exc:
+                        rejected.append({"id": job["id"], "ev": ev, "reason": str(exc)})
+                        continue
+                    except (OSError, TypeError, AttributeError) as exc:
+                        rejected.append({"id": job["id"], "ev": ev, "reason": type(exc).__name__})
+                        continue
+                    planned.append(rec)
+                    if not a.dry_run:
+                        _write_ledger(ledger, rec)
+                        added.append(rec)
+                        known.add((job["id"], ev))
+    except Exception as exc:
+        print(f"cgh: ledger_write_failed: {LEDGER} ({type(exc).__name__})，请回查账本后重试补漏", file=sys.stderr)
+        die("backfill_failed", "账本补漏未完整完成，请先回查已写事件", ledger=str(LEDGER),
+            dry_run=a.dry_run, backfilled=len({r["id"] for r in added}), added_events=len(added),
+            planned_events=len(planned), ids=sorted({r["id"] for r in added}),
+            events=planned, rejected=rejected)
+    ok(backfilled=len({r["id"] for r in added}), added_events=len(added),
+       planned_events=len(planned), dry_run=a.dry_run, skipped=skipped, ledger=str(LEDGER),
+       ids=sorted({r["id"] for r in added}), events=planned, rejected=rejected)
 
 
 def cmd_list(a):
@@ -1804,6 +1875,10 @@ def main():
     s.set_defaults(fn=cmd_outcome)
 
     s = sub.add_parser("backfill", help="把本仓库已有作业补进全机账本（幂等）")
+    s.add_argument("--dry-run", action="store_true", help="只预览缺失事件，不写账本或迁移产物")
+    s.add_argument("--id", dest="ids", action="append", help="只补指定作业，可重复")
+    s.add_argument("--event", dest="events", action="append", choices=["created", "completed"],
+                   help="只补指定事件，可重复；默认两类")
     s.set_defaults(fn=cmd_backfill)
 
     s = sub.add_parser("stats", help="跨仓统计：档位性价比、发起方分布、结论采纳率")

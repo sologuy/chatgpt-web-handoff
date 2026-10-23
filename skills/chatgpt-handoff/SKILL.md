@@ -187,8 +187,15 @@ $CGH confirm --id <id> --url <对话URL>        # 人工确认「那一发确实
 $CGH parse --id <id> --from <原文文件>        # 手工兜底：从已保存的原文解析
 $CGH outcome --id <id> --status adopted|partial|rejected --note "..."   # 记结论的下场
 $CGH stats                                   # 跨仓统计（档位性价比 / 发起方 / 采纳率）
-$CGH backfill                                # 把本仓库已有作业补进全机账本（幂等）
+$CGH stats --json                            # 纯 JSON；summary 按账本事件集合统计
+$CGH backfill --dry-run                      # 只预览本仓库缺失的 created/completed 事件
+$CGH backfill --id <id> --event completed     # 精确补一条完成事件；--id / --event 可重复
+$CGH backfill                                # 补本仓库缺失事件（按 id + 事件查重）
 ```
+
+补漏先看 `--dry-run` 的 `events` 和 `rejected`。完成事件须有 completed 状态、原完成时间、
+有效结果哨兵；原始回答存在时还须解析一致。补漏不改原件、不推断 outcome。
+账本写失败会向 stderr 告警；已发送的 handoff 不因此重投，核对后再补漏。
 
 模型必须在 `bin/cgh_web.py` 的 `EXPECTED_MODELS` 允许列表内（当前包含 `GPT-6`），每次 submit 都会实测回读。本 Skill 只调推理强度，不切模型。
 
