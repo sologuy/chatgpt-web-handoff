@@ -8,6 +8,9 @@ allowed-tools: Bash
 
 # ChatGPT Web Handoff
 
+本仓库另有独立的 `chatgpt-image-gen` Skill，用于 ChatGPT Web 生图并取回文件。
+用 `./scripts/install.sh --skills handoff|image|all` 选择入口；审查继续使用本 Skill。
+
 > 本 Skill 在 Claude Code / Codex / DSH 上行为一致。不依赖任何单一 harness 的模板特性
 > （不用参数占位符替换，也不用反引号内嵌 shell 执行）——所有动态信息一律自己跑命令拿。
 >
@@ -200,7 +203,8 @@ $CGH backfill                                # 补本仓库缺失事件（按 id
 模型必须在 `bin/cgh_web.py` 的 `EXPECTED_MODELS` 允许列表内（当前包含 `GPT-6`），每次 submit 都会实测回读。本 Skill 只调推理强度，不切模型。
 
 **并发**：作业闸门是按仓库算的，不同仓库可以同时跑，互不阻塞。
-但 ChatGPT 的推理强度是账号级共享偏好，所以 `cgh` 在「设档位 → 发送」这一两秒上加了全机互斥。
+但 ChatGPT 的推理强度是账号级共享偏好，所以 `cgh` 与同仓 `cgimg` 共用全机提交锁，
+覆盖设档位、复验、发送与对话 URL 确认；生成和下载期间不占锁。这不增加并发调度能力。
 偶尔看到 `browser_busy` 或 `effort_drifted`，说明另一个 harness 正好在同一秒提交——
 **重跑一次即可，这两种情况都没有发送、不消耗额度**。
 

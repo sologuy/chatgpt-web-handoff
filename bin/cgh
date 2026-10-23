@@ -36,6 +36,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # 穿 symlink 落到仓库 bin/
 
+from cgh_common import (BrowserBusy, BrowserLock, LEDGER, now, detect_origin,
+                        _ledger_record, _write_ledger, ledger_append)
+
 SCHEMA_VERSION = 3      # 3：新增 origin（来源留痕）与 outcome（闭环留痕）
 ID_RE = re.compile(r"^hf_\d{8}_[0-9a-z]{6}$")
 ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -124,10 +127,6 @@ def ok(**payload):
     print(json.dumps({"ok": True, **payload}, ensure_ascii=False, indent=2))
 
 
-def now():
-    return datetime.now().astimezone().isoformat(timespec="seconds")
-
-
 def repo_root(start=None):
     p = Path(start or os.getcwd()).resolve()
     for d in (p, *p.parents):
@@ -187,47 +186,6 @@ def new_id():
     )
 
 
-class BrowserLock:
-    """全机互斥，只保护「设档位 → 发送」这一两秒。
-
-    ChatGPT 的推理强度是**账号级持久化偏好**，跨标签页实时同步（2026-08-19 实测：
-    A 页改成极速，B 页不刷新就跟着变，且中途会短暂显示一个谁都没设过的中间值）。
-    所以两个 harness 同时提交、要的档位不同时，会互相把对方的档位改掉，
-    而各自回读都"正确"，事后查不出来。
-
-    这里刻意**不锁整个作业**：生成阶段（Pro 可达十分钟）不碰这个共享偏好，
-    锁它只会白白扼杀并发。锁住的只有 configure→send 这个真正的临界区。
-    """
-
-    def __init__(self, timeout=180):
-        self.path = Path.home() / ".cgh" / "browser.lock"
-        self.timeout = timeout
-        self.fd = None
-
-    def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
-        deadline = time.time() + self.timeout
-        while True:
-            try:
-                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                os.ftruncate(self.fd, 0)
-                os.write(self.fd, f"{os.getpid()} {now()}\n".encode())
-                return self
-            except BlockingIOError:
-                if time.time() >= deadline:
-                    os.close(self.fd)
-                    die("browser_busy",
-                        f"另一个 cgh 正在设档位/发送，等了 {self.timeout}s 仍未释放",
-                        lock=str(self.path),
-                        hint="正常情况下这一步只占一两秒；一直占着说明有进程卡死，检查后删掉该锁文件")
-                time.sleep(0.2)
-
-    def __exit__(self, *exc):
-        fcntl.flock(self.fd, fcntl.LOCK_UN)
-        os.close(self.fd)
-
-
 class Lock:
     """短时互斥，只保护 job.json 的读-改-写，不做跨进程长期占用。
 
@@ -267,123 +225,6 @@ class SubmitLock(Lock):
 
 
 # ---------------------------------------------------------------- 留痕
-
-# 干跑测试要把账本指到别处，否则测试作业会污染真实的跨仓统计
-LEDGER = Path(os.environ.get("CGH_LEDGER") or (Path.home() / ".cgh" / "ledger.jsonl"))
-
-
-def _git_state(root):
-    def q(*args):
-        try:
-            r = subprocess.run(["git", "-C", str(root), *args],
-                               capture_output=True, text=True, timeout=5)
-            return r.stdout.strip() if r.returncode == 0 else None
-        except Exception:
-            return None
-    head = q("rev-parse", "--short", "HEAD")
-    return {"git_head": head,
-            "git_branch": q("rev-parse", "--abbrev-ref", "HEAD"),
-            "git_dirty": bool(q("status", "--porcelain")) if head else None}
-
-
-def detect_origin(root):
-    """记下「谁在什么状态下发起的这次交接」。
-
-    只按白名单取字段——**绝不遍历 env**，那里面有 CLAUDE_CODE_MESSAGING_TOKEN 这类东西。
-    transcript 只记真实存在的路径：宁可记 null，也不留一条查不到的线索。
-    """
-    e = os.environ
-    o = {"harness": "unknown", "ai_agent": e.get("AI_AGENT"),
-         "version": None, "session_id": None, "transcript": None}
-
-    if e.get("CLAUDECODE") or e.get("CLAUDE_CODE_SESSION_ID"):
-        o["harness"] = "claude-code"
-        o["version"] = e.get("CLAUDE_CODE_VERSION")
-        o["session_id"] = e.get("CLAUDE_CODE_SESSION_ID")
-        if o["session_id"]:
-            # 目录名是启动时 cwd 的 slug，不一定等于仓库根，所以搜一遍
-            hits = list((Path.home() / ".claude" / "projects").glob(f"*/{o['session_id']}.jsonl"))
-            o["transcript"] = str(hits[0]) if hits else None
-    elif e.get("DSH_SESSION_ID"):
-        # DSH 把会话 id 注入**工具 shell**（不是服务进程，去翻服务进程的 env 会扑空）。
-        # 不要取 DSH_PTY_SESSION_ID——那是底层终端进程 id，不是对话 id。
-        o["harness"] = "dsh"
-        o["session_id"] = e.get("DSH_SESSION_ID")
-        # DSH_HOME 是按项目走的，不能假定 ~/.dsh
-        home = e.get("DSH_HOME")
-        if home:
-            hits = list(Path(home).glob(f"sessions/*/{o['session_id']}/session.jsonl.zstd"))
-            o["transcript"] = str(hits[0]) if hits else None
-    elif e.get("CODEX_SESSION_ID"):
-        # Codex CLI 原生。会话记录：~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<sid>.jsonl
-        o["harness"] = "codex"
-        o["session_id"] = e.get("CODEX_SESSION_ID")
-        hits = list((Path.home() / ".codex" / "sessions").glob(
-            f"*/*/*/rollout-*-{o['session_id']}.jsonl"))
-        o["transcript"] = str(hits[0]) if hits else None
-    elif e.get("CODEX_COMPANION_SESSION_ID"):
-        o["harness"] = "codex-companion"
-        o["session_id"] = e.get("CODEX_COMPANION_SESSION_ID")
-        t = e.get("CODEX_COMPANION_TRANSCRIPT_PATH")
-        o["transcript"] = t if t and Path(t).exists() else None
-    elif e.get("HERMES_SESSION_ID"):
-        # 放在最后一个分支：Hermes 会派生 codex 子任务，那种情况下两个 id 都在，
-        # 但真正在跑 cgh 的是 codex，不是 Hermes。
-        o["harness"] = "hermes"
-        o["session_id"] = e.get("HERMES_SESSION_ID")
-        # 会话文件名是 <时间戳>_<id>.jsonl，而 id 到底是整段还是尾段没有定论，
-        # 所以两头都用通配；匹配不上就照旧记 null，不猜。
-        home = Path(e.get("HERMES_HOME") or (Path.home() / ".hermes"))
-        hits = list(home.glob(f"sessions/*{o['session_id']}*.jsonl"))
-        o["transcript"] = str(hits[0]) if len(hits) == 1 else None
-    else:
-        # 认不出的 harness：AI_AGENT 原值照记，另外记下有哪些
-        # *_SESSION_ID 变量**的名字**（只记名字不记值）——下次看账本就知道该接哪个。
-        names = sorted(k for k in e if k.endswith("_SESSION_ID"))
-        if names:
-            o["session_env_names"] = names
-
-    o.update(_git_state(root))
-    o["cwd"] = str(root)
-    return o
-
-
-def _ledger_record(ev, root, job, **extra):
-    origin = job.get("origin") or {}
-    rec = {"ts": extra.pop("ts_override", None) or now(), "ev": ev, "repo": str(root), "id": job.get("id"),
-           "harness": origin.get("harness"), "session_id": origin.get("session_id"),
-           "action": job.get("action"), "subject": job.get("subject"),
-           "effort_requested": job.get("effort_requested"),
-           "effort_actual": job.get("effort_actual"),
-           "parent_id": job.get("parent_id"),
-           "conversation_url": job.get("conversation_url")}
-    rec.update(extra)
-    return rec
-
-
-def _write_ledger(f, rec):
-    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    f.flush()                       # 必须在仍持锁时写出缓冲，不能先解锁再等 close
-
-
-def ledger_append(ev, root, job, **extra):
-    """全机账本。作业散在各使用方仓库里，没有这个就没有跨仓视图。
-
-    append-only + flock —— 多仓库并发是本项目明确支持的场景，不能互相踩。
-    账本写失败告警并返回 False，但不能让已发送的 handoff 被误判成需要重投。
-    """
-    try:
-        rec = _ledger_record(ev, root, job, **extra)
-        LEDGER.parent.mkdir(parents=True, exist_ok=True)
-        with open(LEDGER, "a", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            _write_ledger(f, rec)
-        return True
-    except Exception as exc:
-        print(f"cgh: ledger_write_failed: {LEDGER} ({type(exc).__name__}); "
-              f"id={job.get('id')} ev={ev}，handoff 状态不受影响，请核对后补漏", file=sys.stderr)
-        return False
-
 
 def root_of(d):
     """从作业目录反推使用方仓库根（d 是 <root>/.chatgpt/web-handoff）。"""
@@ -1063,7 +904,7 @@ def _submit_locked(a):
         if not continuing:
             _checkpoint_draft(d, a.id, target_id, web.inspect_draft_state(page))
 
-        # ── 临界区：设档位 → 复验 → 发送。全机互斥，但只占一两秒 ──
+        # ── 临界区：设档位 → 复验 → 发送确认。全机互斥 ──
         # 推理强度是账号级偏好、跨标签页实时同步，别的 harness 同时提交会把它改掉。
         # 生成阶段不在锁内，所以并发能力不受影响。
         with BrowserLock():
@@ -1146,6 +987,16 @@ def _submit_locked(a):
                 _mark(d, a.id, "send_unknown", "send_unknown",
                       f"跨过发送边界后结果不确定：{e}",
                       hint=f"去浏览器看那个标签页；真发出去了 cgh confirm --id {a.id} --url <对话URL>")
+    except BrowserBusy as e:
+        if page:
+            try:
+                page.close()          # 只断 WS，未发送的标签页保留
+            except (cdp.CdpError, OSError):
+                pass
+        die("browser_busy",
+            f"另一个浏览器任务正在设档位/发送，等了 {e.timeout}s 仍未释放",
+            lock=str(e.path),
+            hint="检查正在提交的进程；进程退出后锁会自动释放，不要删除锁文件")
     except web.EffortNotFound as e:
         if page:
             page.close()
@@ -1352,7 +1203,9 @@ def _poll_once(d, job_id, hold=None, resume=False):
         stalled_now = prog["len"] > 0 and prog["len"] == job.get("last_len", 0)
         stalled = stalled_now and job.get("stalled_count", 0) >= 1
 
-        if prog["generating"] or not new_turn or (not sentinel and not stalled):
+        # 停止按钮可能在切换布局时短暂消失；还要有可见发送按钮这一正向空闲证据。
+        if (prog["generating"] or not prog.get("has_send_btn") or not new_turn
+                or (not sentinel and not stalled)):
             with Lock(d):
                 job = load_job(d, job["id"])
                 job["status"] = "generating"

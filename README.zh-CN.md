@@ -1,7 +1,7 @@
-# chatgpt-web-handoff（`cgh`）
+# chatgpt-web-handoff（`cgh` + `cgimg`）
 
-**把编码 agent 手上这个任务的上下文，交接给你日常那个 Chrome 里已登录的 ChatGPT Web，
-再把结构化裁决取回本地仓库。**
+**用你日常那个 Chrome 里已登录的 ChatGPT Web 做独立审查或生成图片，
+把结果取回本地。**
 
 [English](README.md)
 
@@ -19,10 +19,20 @@
 **那个已经登录着的** ChatGPT 标签页，再把回复解析成带
 `verdict` / `findings` / `recommended_actions` 的 `result.md`。
 
+`cgimg` 复用同一套浏览器连接生成图片，支持参考图，并把图片保存到本地。
+两个 Skill 可以分别安装；两个 CLI 和共享模块都在这个仓库里。
+
 不装浏览器插件、不用 Native Messaging、不自建 Broker、不另起 Chrome Profile。
 全程不读取、不复制、不持久化任何凭证——它用的就是你已经登录好的那个会话。
 
 ---
+
+## v0.7.0 · 2026-10-23
+
+- **两个可选 Skill**：同一份仓库可只装 `chatgpt-handoff`、只装 `chatgpt-image-gen`，或两个都装。生图不依赖安装 handoff Skill。
+- **共用浏览器代码**：两个 CLI 共用 ChatGPT UI 检查、raw CDP 传输、来源/账本辅助函数，以及覆盖设档位和发送的短时浏览器锁。
+- **固定极高档生图**：`cgimg` 支持风格、比例和参考图，等待生成后保存图片，以 JSON 返回路径。
+- **保留失败现场**：生图失败保留本次创建的标签页，并在已知时返回页面 ID 和对话 URL。发送未确认时绝不自动重投。
 
 ## v0.6.0 · 2026-10-23
 
@@ -38,27 +48,34 @@
 ## 快速开始
 
 ```bash
-# 1. Chrome 得开着远程调试端口。如果还没开：
+# 1. 可选装一个或两个 Skill；安装本身不需要 Chrome 或 Node
+git clone https://github.com/sologuy/chatgpt-web-handoff.git
+cd chatgpt-web-handoff
+./scripts/install.sh                    # 只装 handoff，保持原有默认行为
+# ./scripts/install.sh --skills image   # 只装生图
+# ./scripts/install.sh --skills all     # 两个都装
+
+# 2. 运行任一 CLI 前，Chrome 得开着远程调试端口：
 #    （先完全退出 Chrome，再执行）
 open -a "Google Chrome" --args --remote-debugging-port=9222     # macOS
 # google-chrome --remote-debugging-port=9222                    # Linux
 
-# 2. 在那个 Chrome 里正常登录 chatgpt.com
-
-# 3. 安装
-git clone https://github.com/sologuy/chatgpt-web-handoff.git
-cd chatgpt-web-handoff
-./scripts/install.sh
+# 3. 在那个 Chrome 里正常登录 chatgpt.com
 
 # 4. 自检
 ./bin/cgh doctor
 ```
 
-`install.sh` 会把 skill symlink 到 `~/.claude/skills/`、`~/.agents/skills/`、
-`~/.codex/skills/`，Claude Code / Codex / DSH 三端读的是同一份。
+`install.sh --skills handoff|image|all` 会把选中的 Skill symlink 到
+`~/.claude/skills/`、`~/.agents/skills/`、`~/.codex/skills/`；已有 `~/.hermes`
+时也会装到 `~/.hermes/skills/`。各 harness 读的是同一份主源。
+脚本写入前会检查全部已选目标，遇到实体文件或目录就停止，不覆盖原件，也不删除未选的 Skill。
+要隔离安装可设 `CGH_INSTALL_HOME=/path/to/install-root`，它只改变安装根目录。
 只要 **Python ≥ 3.9，仅标准库**。不用 pip install，没有构建步骤，不常驻进程。
+可选的 `--register-mcp` 需要 Node、npx 和 Claude Code；该 MCP 只用于诊断，
+两个 CLI 正常运行都不依赖它。
 
-## 怎么用
+## 怎么做 handoff
 
 正常入口是 skill，在 Claude Code / Codex / DSH 里直接说：
 
@@ -106,7 +123,35 @@ $CGH backfill --id <job_id> --event completed
 | `doctor` | 开工自检：端口通不通、登没登录、找不找得到标签页、档位读不读得到 |
 | `list` / `state` / `abort` / `confirm` / `parse` | 账本与手工兜底 |
 
-## 取回来的是什么
+## 怎么生图
+
+使用 `--skills image` 或 `--skills all` 安装后，可以直接调用 Skill：
+
+```
+/chatgpt-image-gen  一只橘猫蹲在旧书店的木梯上，午后阳光斜射进来
+```
+
+也可以调 CLI：
+
+```bash
+./bin/cgimg "一只橘猫蹲在旧书店的木梯上" \
+  --style "写实摄影，浅景深" --aspect 3:2 --out ./images
+
+./bin/cgimg "把这个场景画成水彩" --ref ./reference.png --out ./images
+```
+
+`cgimg` **固定极高档（xhigh）**，在前台等待生成和保存完成，以 JSON 的 `images[].path`
+返回落盘路径。`--ref` 可重复传入；`--note` 追加要求，`--max` 限制保存张数，
+`--timeout` / `--interval` 控制等待，`--keep-tab` 让成功后仍保留对话页。
+模型会实测回读；`--allow-model-drift` 明确放行预期列表外的模型，但不会降低推理档位。
+完整参数见 `./bin/cgimg --help`。
+
+失败会保留本次创建的标签页，并在已知时返回页面 ID 和对话 URL。
+**遇到 `send_unknown`、生成超时、下载或保存失败，不要直接重跑：**原请求可能已经在生成，
+或已经完成。先查看原对话。成功时默认只关闭本次创建的页，不动其他标签页。
+下载不完整时，除已保存路径外还要检查逐图错误。
+
+## handoff 取回来的是什么
 
 `result.md` 存**未经改写的原始回复**，外加解析出的结构化块：
 
@@ -126,19 +171,21 @@ missing_information: […]
 ## 它是怎么工作的
 
 ```
-你的 agent（Claude Code / Codex / DSH）
-   └─ skill：只负责写 request.md，别的什么都不干
-        └─ cgh（确定性：作业账本、锁、档位控制、结果解析）
-             └─ 裸 CDP → 127.0.0.1:9222
-                  └─ 你日常那个 Chrome，ChatGPT 已登录
-                       └─ 产物落在 <你的仓库>/.chatgpt/web-handoff/<job_id>/
+你的 agent（Claude Code / Codex / DSH / Hermes）
+   ├─ chatgpt-handoff → cgh → 仓库里的 request.md / result.md
+   └─ chatgpt-image-gen → cgimg → --out 指定的图片文件
+        两个 CLI 共用：
+        cgh_common.py（来源、账本、浏览器锁）
+        cgh_web.py（ChatGPT UI）→ cgh_cdp.py（raw CDP）
+             → 127.0.0.1:9222 → 你已登录的 Chrome
 ```
 
 浏览器那一整套编排在**代码里，不在提示词里**。这是刻意的：二十步带状态转换和分支的流程
 本质是状态机，写成提示词就无法断言、无法 diff、无法回归——它不会报错，只会悄悄漂移。
 每一步为什么这么写，都在 `bin/cgh_web.py` 的注释里。
+Handoff 产物仍落在 `<你的仓库>/.chatgpt/web-handoff/<job_id>/`。
 
-## 真正被代码执行的保证
+## handoff 的代码保证
 
 下面每条都是代码里在查的，不是文档里许的愿：
 
@@ -147,7 +194,7 @@ missing_information: […]
 - **档位设完要回读**，发送前再复验一次——推理档位是账号级偏好，
   另一个标签页随时可能把它改掉。
 - **模型是实测回读的**，不是假设的（用 `CGH_EXPECTED_MODEL` 钉你自己的）。
-- **页面白名单。** 任何点击前先确认 host 属于 `chatgpt.com`。
+- **页面白名单。** 任何点击前先确认 host 属于 `chatgpt.com` 或 `chat.openai.com`。
 - **发送幂等。** 发出去了但对话 URL 没出现，会置 `send_unknown`——
   非终态，且拒绝自动重投。
 - **你的原话被 sha256 冻结**并交叉校验，agent 改不了你要审什么，
@@ -162,9 +209,10 @@ missing_information: […]
 - **档位标签只匹配中英文。** 其他界面语言会明确失败在 `effort_not_found` 并列出实际看到的
   标签，把你的加进 `EFFORT_LABELS` 即可。
 - **不写单元测试。** 这里的验证靠真跑——干跑测不出浏览器那一半。
-  改完重跑一次真实的低档位作业。
-- **每个仓库同时只跑一个作业**，用 lockfile 实拦。不同仓库并行互不阻塞；
-  全机互斥只锁「设档位 → 发送」那一两秒。
+  改动 `bin/` 后须真跑低档位 handoff 和生图，并包含带参考图的验证。
+- **每个仓库同时只跑一个 handoff 作业**，用 lockfile 实拦。两个 CLI 共用
+  `~/.cgh/browser.lock`，只锁设档位、模型/档位复验、发送与确认；上传、生成和下载都在锁外。
+  这不提供批量运行或并发调度能力。
 - **这是个人的、本地的、低频的工具。** 它不是 ChatGPT API 的替代品，不是共享服务，
   不做批量。自动化操作 Web 会话与服务条款的关系需要你自己判断，后果也由你承担。
 
