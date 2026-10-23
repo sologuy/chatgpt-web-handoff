@@ -7,10 +7,12 @@
 """
 
 import base64
+import hashlib
 import json
 import os
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import cgh_cdp as cdp
 from cgh_cdp import CdpError
@@ -86,6 +88,12 @@ _SEND_BTN = """(() => {
   const named = [...document.querySelectorAll('button,[role="button"]')].find(b =>
     /^(发送|Send prompt)$/.test(b.getAttribute('aria-label') || '') && visible(b));
   return named || [...document.querySelectorAll('[data-testid="send-button"]')].find(visible) || null;
+})()"""
+
+_STOP_BTN = """(() => {
+  // 完成后隐藏 form 仍可残留停止按钮，只有可见按钮才表示仍在生成。
+  return [...document.querySelectorAll('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]')]
+    .find(b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }) || null;
 })()"""
 
 _PICKER = '[data-testid="composer-intelligence-picker-content"], [role="menu"]:has([role="slider"])'
@@ -186,14 +194,20 @@ def _find_blank_chat(owned_ids=()):
     return None, None
 
 
-def open_new_chat(timeout=PAGE_TIMEOUT, owned_ids=()):
+def open_new_chat(timeout=PAGE_TIMEOUT, owned_ids=(), on_page=None):
     """开一个干净的新会话页，绝不复用用户已有的对话页。
 
-    owned_ids 是本仓库历史作业用过的 targetId，只在这个集合里找可复用的空白页。
+    owned_ids 仅限调用方当前作业的 targetId，不跨作业回收历史页面。
     """
     page, target_id = _find_blank_chat(owned_ids)
     if page is None:
-        page, target_id = cdp.open_page("https://chatgpt.com/", timeout=timeout)
+        page, target_id = cdp.open_page("https://chatgpt.com/", timeout=timeout, on_created=on_page)
+    elif on_page:
+        try:
+            on_page(target_id)
+        except Exception:
+            page.close()
+            raise
     try:
         # 后台新标签页会被 Chrome 立刻降频（页面一多尤其明显），第一次 evaluate
         # 可能直接超时而不是返回慢。所以先把它唤醒——unfreeze 自带 30s 预算和重试，
@@ -619,6 +633,88 @@ def drop_chips(page):
     return page.call_fn(_DROP_CHIPS_JS.replace("ARG", "null"), None, timeout=60)
 
 
+def inspect_draft_state(page):
+    """只读未发送现场；正文只返回摘要，不把它再存一份到作业元数据。"""
+    guard_host(page)
+    state = page.evaluate("(() => {" + _TEXT_JS + _CHIPS_JS + _UPLOADS_JS + _MESSAGES_JS + """
+        const r = _composer && _composer.getBoundingClientRect();
+        return {root_path: location.pathname === '/',
+                has_composer: !!r && r.width > 0 && r.height > 0,
+                messages: _messageCount(),
+                generating: !!(""" + _STOP_BTN + """),
+                text: _logical().trim(), chips: chips(), uploads: _upNames()};
+    })()""")
+    text = state.pop("text")
+    state["text_len"] = len(text)
+    state["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return state
+
+
+def blank_draft(state):
+    return (state["root_path"] and state["has_composer"] and not state["messages"]
+            and not state["generating"] and not state["text_len"]
+            and not state["chips"] and not state["uploads"])
+
+
+def reuse_pending_chat(pending, timeout=PAGE_TIMEOUT):
+    """仅恢复本作业的未发首页。存在但不可核验的页必须停下，不能换一页掩盖失败。"""
+    target_id = pending["target_id"]
+    if not cdp.target_exists(target_id):
+        return None, None
+    page = None
+    try:
+        page = cdp.attach(target_id)
+        guard_host(page)
+        _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))",
+              "输入框就绪", timeout)
+        state = inspect_draft_state(page)
+        safe = state["root_path"] and state["has_composer"] and not state["messages"] and not state["generating"]
+        if not safe or not (blank_draft(state) or state == pending.get("snapshot")):
+            raise CdpError(f"待确认页面 {target_id} 已改变或无法核验，保留现场；未清理、未另开页面")
+        return page, target_id
+    except Exception:
+        if page:
+            page.close()
+        raise
+
+
+def clear_verified_draft(page):
+    """调用方已经核验归属；清空旧内容后按当前源文件重新准备，绝不发送缓存附件。"""
+    guard_host(page)
+    if drop_uploads(page):
+        raise CdpError("已核验草稿的上传件未清空，已停止")
+    guard_host(page)
+    if drop_chips(page).get("chips"):
+        raise CdpError("已核验草稿的文本附件未清空，已停止")
+    guard_host(page)
+    _paste(page, "", clear=True)
+    if not blank_draft(inspect_draft_state(page)):
+        raise CdpError("已核验草稿未完全清空，已停止")
+
+
+def cleanup_empty_chat(target_id, page=None):
+    """仅供自检回收自己新建的页；不确定或非空就保留，并回查关闭结果。"""
+    attached = None
+    try:
+        if not cdp.target_exists(target_id):
+            return {"closed": True, "reason": "页面已不存在"}
+        if page is None:
+            page = attached = cdp.attach(target_id)
+        if not blank_draft(inspect_draft_state(page)) or not check_login(page):
+            return {"closed": False, "reason": "页面非空或不是可识别的已登录首页"}
+        cdp.close_target(target_id)
+        deadline = time.monotonic() + 2
+        while cdp.target_exists(target_id) and time.monotonic() < deadline:
+            time.sleep(0.1)       # Target.closeTarget 的回复早于 /json/list 移除
+        closed = not cdp.target_exists(target_id)
+        return {"closed": closed, "reason": None if closed else "关闭后页面仍存在"}
+    except (CdpError, OSError) as e:
+        return {"closed": False, "reason": str(e)}
+    finally:
+        if attached:
+            attached.close()
+
+
 def _paste(page, text, clear, budget=20000, timeout=90):
     got = page.call_fn(_PASTE_JS, {"text": text, "clear": clear, "budget": budget},
                        timeout=timeout)
@@ -713,7 +809,7 @@ def send(page, confirm=12):
             len: el ? el.innerText.trim().length : -1,
             users: _messages('user').length,
             url: location.pathname,
-            stop: !!document.querySelector('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]'),
+            stop: !!(""" + _STOP_BTN + """),
             send: !!(""" + _SEND_BTN + """)});
     })()"""
 
@@ -776,9 +872,24 @@ def send(page, confirm=12):
 
 
 CONV_URL_JS = """(() => {
-  const m = location.pathname.match(/^\\/c\\/(.+)$/);
-  return m && !m[1].startsWith('WEB:') ? location.href : null;
+  const m = location.pathname.match(/^\\/c\\/([^/]+)$/);
+  if (!m) return null;
+  let id;
+  try { id = decodeURIComponent(m[1]); } catch (_) { return null; }
+  return id && !/[:/]/.test(id) ? location.href : null;
 })()"""
+
+
+def is_temporary_conversation_url(url):
+    path = urlsplit(url or "").path
+    return path.startswith("/c/") and ":" in unquote(path[3:])
+
+
+def is_conversation_url(url):
+    parsed = urlsplit(url or "")
+    ident = unquote(parsed.path[3:]) if parsed.path.startswith("/c/") else ""
+    return (parsed.scheme == "https" and parsed.netloc in CHATGPT_HOSTS
+            and bool(ident) and ":" not in ident and "/" not in ident)
 
 
 def wait_conversation_url(page, timeout=60):
@@ -801,7 +912,7 @@ _PROGRESS_JS = "(() => {" + _MESSAGES_JS + """
   const t = _messageText(last);
   return {
     url: location.href,
-    generating: !!document.querySelector('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]'),
+    generating: !!(""" + _STOP_BTN + """),
     assistant_msgs: a.length,
     user_msgs: u.length,
     has_messages: a.length + u.length > 0,
@@ -857,9 +968,10 @@ def save_failed_page(page, directory):
     (directory / 'failed-page.webp').write_bytes(base64.b64decode(shot['data']))
 
 
-def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT):
+def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT, on_reopen=None):
     """优先复用 submit 时那个标签页；被关掉了就用 conversation_url 重开一个。"""
-    if page_id:
+    if page_id and cdp.target_exists(page_id):
+        page = None
         try:
             page = cdp.attach(page_id)
             guard_host(page)
@@ -867,11 +979,15 @@ def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT):
             # 或者页面还在重建。不等就会在后面注入时撞上空的 composer。
             _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout)
             return page, page_id, False
-        except CdpError:
-            pass
+        except Exception:
+            if page:
+                page.close()
+            raise                # target 还在：连接/UI 失败不能靠另开页面掩盖
     if not conversation_url:
         raise CdpError("既没有可用标签页，job.json 里也没有 conversation_url")
-    page, target_id = cdp.open_page(conversation_url, timeout=timeout)
+    if not is_conversation_url(conversation_url):
+        raise CdpError("没有可用标签页，且会话 URL 不是正式地址；保留作业，未另开页面")
+    page, target_id = cdp.open_page(conversation_url, timeout=timeout, on_created=on_reopen)
     try:
         guard_host(page)
         # 会话内容是异步渲染的。刚打开就读会拿到 0 条消息 + 无停止按钮，

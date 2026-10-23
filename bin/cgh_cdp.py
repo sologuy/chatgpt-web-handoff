@@ -437,7 +437,7 @@ def _page_ws(target_id):
     raise CdpError(f"新标签页 {target_id} 未出现在 /json/list")
 
 
-def open_page(url, timeout=60, background=True):
+def open_page(url, timeout=60, background=True, on_created=None):
     """新开标签页并返回 (Page, target_id)。走浏览器级 Target.createTarget，比 PUT /json/new 稳。
 
     默认后台创建：不抢焦点、不闪标签页。
@@ -461,6 +461,8 @@ def open_page(url, timeout=60, background=True):
             target_id = browser.call("Target.createTarget", params)["targetId"]
     finally:
         browser.close()
+    if on_created:
+        on_created(target_id)     # 先交还归属，再连接和等待；失败也能找到这一页
     page = Page(_page_ws(target_id))
     page.call("Page.enable")
     page.call("Runtime.enable")
@@ -484,6 +486,10 @@ def attach(target_id):
     page = Page(_page_ws(target_id))
     page.unfreeze()
     return page
+
+
+def target_exists(target_id):
+    return any(p.get("id") == target_id for p in list_pages())
 
 
 def close_target(target_id):

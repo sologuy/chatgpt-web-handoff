@@ -248,6 +248,23 @@ class Lock:
         os.close(self.fd)
 
 
+class SubmitLock(Lock):
+    """同一作业的选页、准备和发送不能交错；不占用生成阶段。"""
+
+    def __init__(self, jd):
+        self.path = jd / ".submit.lock"
+        self.fd = None
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self.fd)
+            die("submit_busy", "同一作业已有 submit 正在运行，本次未修改状态或页面")
+        return self
+
+
 # ---------------------------------------------------------------- 留痕
 
 # 干跑测试要把账本指到别处，否则测试作业会污染真实的跨仓统计
@@ -896,7 +913,37 @@ def _format_tail(job_id, body):
     return head + "回答的最后，请用一个 fenced code block 原样输出下面这段，字段名与顺序不要改：\n\n" + block
 
 
+def _remember_page(d, job_id, target_id, pending=False):
+    with Lock(d):
+        job = load_job(d, job_id)
+        if pending:
+            job["pending_page"] = {"target_id": target_id, "snapshot": None}
+        else:
+            job["page_id"] = target_id
+        save_job(d, job)
+
+
+def _checkpoint_draft(d, job_id, target_id, snapshot):
+    from cgh_cdp import CdpError
+    if (not snapshot["root_path"] or not snapshot["has_composer"]
+            or snapshot["messages"] or snapshot["generating"]):
+        raise CdpError("准备阶段页面已不是可核验的未发首页，未更新可信快照")
+    with Lock(d):
+        job = load_job(d, job_id)
+        if (job.get("pending_page") or {}).get("target_id") != target_id:
+            raise CdpError("待确认页面归属已改变，未更新可信快照")
+        job["pending_page"]["snapshot"] = snapshot
+        save_job(d, job)
+
+
 def cmd_submit(a):
+    d = handoffs_dir(repo_root(a.root))
+    load_job(d, a.id)              # 获取锁前只检查存在；锁内再读最新状态
+    with SubmitLock(d / a.id):
+        _submit_locked(a)
+
+
+def _submit_locked(a):
     import cgh_cdp as cdp
     import cgh_web as web
 
@@ -965,10 +1012,20 @@ def cmd_submit(a):
             # 续聊：复用父作业那个对话。attach_or_open 先按 page_id 认标签页，
             # 被关掉了就按 conversation_url 重开——正是"tab 还活着就接着聊"。
             page, target_id, reopened = web.attach_or_open(
-                job.get("page_id"), job["continue_from"])
+                job.get("page_id"), job["continue_from"],
+                on_reopen=lambda tid: _remember_page(d, a.id, tid))
         else:
-            owned = {j.get("page_id") for j in all_jobs(d) if j.get("page_id")}
-            page, target_id = web.open_new_chat(owned_ids=owned)
+            pending = job.get("pending_page")
+            if pending:
+                page, target_id = web.reuse_pending_chat(pending)
+            if page is None:
+                owned = [job["page_id"]] if job.get("page_id") else []
+                page, target_id = web.open_new_chat(
+                    owned_ids=owned, on_page=lambda tid: _remember_page(d, a.id, tid, pending=True))
+                if not web.blank_draft(web.inspect_draft_state(page)):
+                    raise cdp.CdpError("新选页面不是空白首页，保留现场，未清理")
+            web.clear_verified_draft(page)
+            _checkpoint_draft(d, a.id, target_id, web.inspect_draft_state(page))
         web.guard_host(page)
         turns_before = web.count_assistant(page) if continuing else 0
         # 条数不可靠（虚拟化会把旧消息移出 DOM），所以另记一份内容指纹：
@@ -984,10 +1041,14 @@ def cmd_submit(a):
             if gone:
                 raise cdp.CdpError(f"附件在建作业之后被移走了：{gone}")
             uploaded = web.attach_files(page, [a["path"] for a in atts])
+            if not continuing:
+                _checkpoint_draft(d, a.id, target_id, web.inspect_draft_state(page))
 
         # 正文超长时 ChatGPT 会转成附件，格式要求会跟着沉进去。
         # 把哨兵那一段单独内联，保证输出格式指令 ChatGPT 一定看得见。
         injected = web.inject(page, body, tail=_format_tail(job["id"], body))
+        if not continuing:
+            _checkpoint_draft(d, a.id, target_id, web.inspect_draft_state(page))
 
         # ── 临界区：设档位 → 复验 → 发送。全机互斥，但只占一两秒 ──
         # 推理强度是账号级偏好、跨标签页实时同步，别的 harness 同时提交会把它改掉。
@@ -1000,7 +1061,6 @@ def cmd_submit(a):
                 job["effort_available"] = eff["available"]
                 job["model_actual"] = eff["model"]
                 job["model_toggle"] = eff.get("model_toggle")
-                job["page_id"] = target_id
                 save_job(d, job)
 
             if eff["model"] and eff["model"] not in web.EXPECTED_MODELS and not a.allow_model_drift:
@@ -1034,6 +1094,7 @@ def cmd_submit(a):
                     die("send_unknown", "另一个 submit 已经跨过发送边界，本次退出以免重复发送",
                         job_id=a.id, send_attempted_at=fresh["send_attempted_at"])
                 fresh["send_attempted_at"] = now()
+                fresh["page_id"] = target_id
                 if continuing:
                     # 记下发送前的现场：poll 要靠它区分「新回合」与「上一轮的旧回答」
                     fresh["turns_before"] = turns_before
@@ -1064,7 +1125,7 @@ def cmd_submit(a):
                     # 续聊时 URL 不变，wait_conversation_url 会立刻返回、等于没验。
                     # 改看真实证据：新回合出现（助手消息数增加或停止按钮亮起）。
                     web.wait_new_turn(page, turns_before)
-                    url = job["continue_from"]
+                    url = web.wait_conversation_url(page)
                 else:
                     url = web.wait_conversation_url(page)
             except Exception as e:
@@ -1102,6 +1163,7 @@ def cmd_submit(a):
         # 只是"投进去多少字"，不等于"附件里验证到多少字"——别在事后审计时误当成完整性已验证
         job["requested_chars"] = injected.get("requested_chars")
         job["conversation_url"] = url
+        job["pending_page"] = None
         job["error"] = None
         save_job(d, job)
     page.close()
@@ -1122,6 +1184,7 @@ def cmd_confirm(a):
 
     比让用户手搓 `cgh update` 好：这里知道该同时补哪几个字段、该做哪些校验。
     """
+    import cgh_web as web
     d = handoffs_dir(repo_root(a.root))
     with Lock(d):
         job = load_job(d, a.id)
@@ -1129,15 +1192,16 @@ def cmd_confirm(a):
             die("not_sent", "这个作业没有跨过发送边界，没什么可确认的",
                 status=job["status"])
         url = a.url.strip()
-        if not re.match(r"^https://(chatgpt\.com|chat\.openai\.com)/c/[^/]+$", url):
-            die("bad_url", "对话 URL 形如 https://chatgpt.com/c/<id>", got=url)
-        if "/c/WEB:" in url:
+        if web.is_temporary_conversation_url(url):
             die("bad_url", "这是客户端临时 id，事后打不开。在浏览器里等它变成真 id 再抄",
                 got=url)
+        if not web.is_conversation_url(url):
+            die("bad_url", "对话 URL 形如 https://chatgpt.com/c/<id>", got=url)
         job["conversation_url"] = url
         job["status"] = "submitted"
         job["submitted_at"] = job.get("submitted_at") or now()
         job["error"] = None
+        job["pending_page"] = None
         job["notes"].append(f"{now()} 人工确认发送成功：{url}")
         save_job(d, job)
     ledger_append("submitted", root_of(d), job, confirmed_by_human=True)
@@ -1210,7 +1274,9 @@ def _poll_once(d, job_id, hold=None, resume=False):
             else:
                 web.guard_host(page)          # 活着就照常校验白名单，人可能把这页导航走了
         if page is None:
-            page, tid, opened = web.attach_or_open(job.get("page_id"), job.get("conversation_url"))
+            page, tid, opened = web.attach_or_open(
+                job.get("page_id"), job.get("conversation_url"),
+                on_reopen=lambda target: _remember_page(d, job_id, target))
             if hold is not None:
                 hold["page"] = page
             if opened:
@@ -1220,6 +1286,14 @@ def _poll_once(d, job_id, hold=None, resume=False):
                     j["page_id"] = tid
                     save_job(d, j)
         prog = web.read_progress(page)
+        if (web.is_temporary_conversation_url(job.get("conversation_url"))
+                and web.is_conversation_url(prog.get("url"))):
+            with Lock(d):
+                j = load_job(d, job_id)
+                if web.is_temporary_conversation_url(j.get("conversation_url")):
+                    j["conversation_url"] = prog["url"]
+                    j["notes"].append(f"{now()} 已从原标签页回读正式会话 URL")
+                    save_job(d, j)
         sentinel = f"CGH_END_{job['id']}" in prog["tail"]
 
         # 续聊时最后一条助手消息一开始还是上一轮那条（已完成、且不含本轮哨兵）。
@@ -1384,13 +1458,25 @@ def cmd_doctor(a):
     report["chatgpt_tabs"] = sum(1 for p in pages
                                  if any(h in p.get("url", "") for h in web.CHATGPT_HOSTS))
     if a.deep:
-        page, tid = web.open_new_chat()
+        page = None
+        created = []
+        failure = None
         try:
+            page, tid = web.open_new_chat(on_page=created.append)
             report["host"] = web.guard_host(page)
             report["logged_in"] = web.check_login(page)
             report["effort_now"] = web.read_effort(page)
+        except (cdp.CdpError, OSError) as e:
+            failure = str(e)
         finally:
-            page.close()      # 标签页留着，不关
+            if created:
+                cleanup = web.cleanup_empty_chat(created[0], page)
+                report.update(page_id=created[0], cleanup_closed=cleanup["closed"],
+                              cleanup_kept_reason=cleanup["reason"])
+            if page:
+                page.close()
+        if failure:
+            die("doctor_failed", failure, **report)
     d = handoffs_dir(repo_root(a.root))
     act = active_job(d)
     report["active_job"] = act["id"] if act else None
