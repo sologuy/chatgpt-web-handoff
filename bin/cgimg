@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""cgimg：用已登录的 ChatGPT Web 出图；与 cgh 共用 CDP、页面语义、锁和账本。
+
+固定 xhigh；本命令前台等待图片，失败保留本次页面，不自动重新提交。
+图片只在原页面内 fetch，不读取凭证，不改变 Chrome 下载设置。
+"""
+
+import sys
+
+if sys.version_info < (3, 9):
+    sys.stderr.write("cgimg 需要 Python >= 3.9\n")
+    raise SystemExit(2)
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import cgh_cdp as cdp
+import cgh_web as web
+from cgh_common import BrowserBusy, BrowserLock, detect_origin, ledger_append, now
+
+EFFORT = "xhigh"
+MIN_SIDE = 256
+EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+
+
+class ImageError(Exception):
+    def __init__(self, code, message, **extra):
+        super().__init__(message)
+        self.code, self.extra = code, extra
+
+
+def _ledger(ev, meta, **extra):
+    job = {"id": meta["id"], "action": "image", "subject": meta["subject"],
+           "effort_requested": EFFORT, "effort_actual": meta.get("effort_actual"),
+           "parent_id": None, "conversation_url": meta.get("conversation_url"),
+           "origin": meta["origin"]}
+    return ledger_append(ev, meta["repo"], job,
+                         elapsed=round(time.time() - meta["t0"], 1),
+                         prompt=meta["prompt"], refs=meta["refs"],
+                         style=meta.get("style"), aspect=meta.get("aspect"),
+                         model=meta.get("model"), page_id=meta.get("page_id"),
+                         send_attempted_at=meta.get("send_attempted_at"), **extra)
+
+
+def build_prompt(a):
+    bits = [f"请直接生成一张图片：{a.prompt.strip()}"]
+    if a.style:
+        bits.append(f"风格：{a.style.strip()}")
+    if a.aspect:
+        bits.append(f"画面比例：{a.aspect.strip()}")
+    if a.ref:
+        bits.append("请参考我上传的图片。")
+    bits.append("直接出图，不要向我提问、不要先描述你打算怎么画。只要图。")
+    if a.note:
+        bits.append(a.note.strip())
+    return "\n".join(bits)
+
+
+def _image_type(raw):
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return "image/webp"
+    raise ValueError("返回内容不是可识别的 PNG/JPEG/WebP/GIF 图片")
+
+
+def _save_images(page, images, output, is_file, job_id):
+    saved, failed = [], []
+    for i, im in enumerate(images, 1):
+        i = im.get("index", i)
+        dst = None
+        try:
+            data = web.fetch_image(page, im["src"])
+            if not data.get("ok"):
+                raise ValueError(data.get("why", "fetch_failed"))
+            raw = base64.b64decode(data["b64"], validate=True)
+            mime = _image_type(raw)
+            declared = data.get("type", "").split(";", 1)[0].strip().lower()
+            if declared and declared != mime:
+                raise ValueError(f"图片类型不符：响应 {declared}，实际 {mime}")
+            if is_file:
+                dst = output if len(images) == 1 else output.with_name(f"{output.stem}-{i}{output.suffix}")
+                allowed = {EXT[mime], "jpeg"} if mime == "image/jpeg" else {EXT[mime]}
+                if dst.suffix.lower().lstrip(".") not in allowed:
+                    raise ValueError(f"输出扩展名 {dst.suffix} 与实际 {mime} 不符，请从保留的页面取图")
+            else:
+                dst = output / f"chatgpt-{job_id}-{i}.{EXT[mime]}"
+            # 不覆盖用户已有文件；中断时即使留下不完整文件，原件也不受影响。
+            with dst.open("xb") as f:
+                f.write(raw)
+            if dst.read_bytes() != raw:
+                raise OSError(f"写后回读不一致：{dst}")
+            saved.append({"index": i, "path": str(dst.resolve()), "bytes": len(raw),
+                          "w": im["w"], "h": im["h"], "mime": mime,
+                          "sha256": hashlib.sha256(raw).hexdigest()})
+        except (cdp.CdpError, OSError, ValueError, KeyError) as exc:
+            failed.append({"index": i, "error": type(exc).__name__, "message": str(exc)[:300],
+                           "path": str(dst) if dst else None})
+    return saved, failed
+
+
+def run(a, meta):
+    page = None
+    payload = None
+
+    def remember_page(target):
+        meta["page_id"] = target
+        print(json.dumps({"event": "page_created", "id": meta["id"], "page_id": target}),
+              file=sys.stderr, flush=True)
+
+    try:
+        refs = []
+        for name in a.ref or []:
+            ref = Path(name).expanduser()
+            if not ref.is_file():
+                raise ImageError("ref_not_found", f"参考图不存在：{name}")
+            refs.append(str(ref.resolve()))
+        meta["refs"] = refs
+        output = Path(a.out).expanduser().resolve()
+        is_file = bool(output.suffix) and not output.is_dir()
+        if output.exists() and not output.is_dir():
+            raise ImageError("output_exists", f"输出文件已存在，不覆盖：{output}")
+        if is_file and output.suffix.lower().lstrip(".") not in {"png", "jpg", "jpeg", "webp", "gif"}:
+            raise ImageError("output_type", "输出文件请使用 PNG/JPEG/WebP/GIF 扩展名，或指定目录")
+        (output.parent if is_file else output).mkdir(parents=True, exist_ok=True)
+
+        page, tid = web.open_new_chat(on_page=remember_page)
+        web.guard_host(page)
+        if not web.check_login(page):
+            raise ImageError("auth_required", "ChatGPT 未登录")
+        if refs:
+            web.attach_files(page, refs)
+        before = [im["src"] for im in web.read_image_state(page)["images"]]
+        web.inject(page, meta["prompt"])
+
+        with BrowserLock():
+            web.guard_host(page)
+            cfg = web.configure(page, EFFORT)
+            meta.update(effort_actual=cfg["effort_actual"], model=cfg["model"])
+            if cfg["model"] and cfg["model"] not in web.EXPECTED_MODELS and not a.allow_model_drift:
+                raise ImageError("model_changed", f"模型不在允许列表 {web.EXPECTED_MODELS}，实测 {cfg['model']}")
+            web.guard_host(page)
+            settled = web.read_effort(page)
+            if settled not in web._labels(EFFORT):
+                raise ImageError("effort_drifted", f"发送前档位变成 {settled}，要求 {EFFORT}")
+            meta["send_attempted_at"] = now()
+            print(json.dumps({"event": "send_attempted", "id": meta["id"],
+                              "page_id": meta["page_id"], "at": meta["send_attempted_at"]}),
+                  file=sys.stderr, flush=True)
+            try:
+                web.send(page)
+                meta["conversation_url"] = web.wait_conversation_url(page, timeout=90)
+            except web.SendNotTaken as exc:
+                meta["send_attempted_at"] = None
+                raise ImageError("send_not_taken", str(exc)) from exc
+            except Exception as exc:
+                raise ImageError("send_unknown", f"已跨发送边界，发送结果不确定：{exc}") from exc
+
+        deadline = time.monotonic() + a.timeout
+        stable = None
+        while time.monotonic() < deadline:
+            state = web.read_image_state(page, before, MIN_SIDE, a.max)
+            if not state["has_composer"] and not state["has_send_btn"]:
+                raise ImageError("ui_changed", "找不到输入框与发送按钮，无法判断生成状态")
+            if not state["has_messages"] and not state["generating"]:
+                raise ImageError("ui_changed", "无法识别对话消息，不能据此判定完成")
+            images = state["images"]
+            print(f"生成中={state['generating']} 已出图={len(images)}", file=sys.stderr, flush=True)
+            signature = ([(im["src"], im["w"], im["h"]) for im in images], state["failed_images"])
+            ready = ((images or state["failed_images"]) and not state["generating"] and state["has_send_btn"]
+                     and not state["pending_images"])
+            if ready and signature == stable:
+                break
+            stable = signature if ready else None
+            time.sleep(min(a.interval, max(0, deadline - time.monotonic())))
+        else:
+            raise ImageError("timeout", f"等待 {a.timeout}s 未取得完整图片",
+                             assistant_text=web.read_full(page)[-400:])
+
+        saved, failed = _save_images(page, images, output, is_file, meta["id"])
+        failed.extend(state["failed_images"])
+        if failed:
+            raise ImageError("image_download_failed", "部分或全部图片未能保存，页面已保留",
+                             images=saved, failed_images=failed)
+        payload = {"ok": True, "prompt": meta["prompt"], "images": saved,
+                   "failed_images": [], "images_available": state["images_available"]}
+        _ledger("image", meta, ok=True, images=saved)
+    except Exception as exc:
+        if isinstance(exc, ImageError):
+            code, extra = exc.code, exc.extra
+        elif isinstance(exc, BrowserBusy):
+            code, extra = "browser_busy", {"lock": str(exc.path)}
+        elif isinstance(exc, web.EffortNotFound):
+            code, extra = "effort_not_found", {"effort_available": exc.available}
+        elif isinstance(exc, web.WrongPage):
+            code, extra = "wrong_page", {}
+        else:
+            code, extra = ("open_failed" if page is None else "ui_changed"), {}
+        payload = {"ok": False, "error": code, "message": str(exc), **extra}
+        if meta.get("send_attempted_at"):
+            payload["hint"] = "已尝试发送，请检查保留的会话；不要重新提交以免重复生成"
+        elif meta.get("page_id"):
+            payload["hint"] = "尚未发送，页面保留；先检查现场再决定重试"
+        _ledger("image_failed", meta, error=code, message=str(exc)[:300],
+                images=payload.get("images", []), failed_images=payload.get("failed_images", []))
+        if page is not None and code == "ui_changed":
+            diagnostics = Path.home() / ".cgh" / "diagnostics" / meta["id"]
+            try:
+                diagnostics.mkdir(parents=True, exist_ok=True)
+                web.save_failed_page(page, diagnostics)
+                payload["diagnostics"] = str(diagnostics)
+            except (cdp.CdpError, OSError):
+                pass
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+        if payload is not None:
+            payload.update(id=meta["id"], effort=meta.get("effort_actual"), effort_requested=EFFORT,
+                           effort_actual=meta.get("effort_actual"), model=meta.get("model"),
+                           page_id=meta.get("page_id"), conversation_url=meta.get("conversation_url"),
+                           send_attempted_at=meta.get("send_attempted_at"))
+            payload["tab_closed"] = False
+            if payload["ok"] and not a.keep_tab and meta.get("page_id"):
+                try:
+                    cdp.close_target(meta["page_id"])
+                    deadline = time.monotonic() + 2
+                    while cdp.target_exists(meta["page_id"]) and time.monotonic() < deadline:
+                        time.sleep(0.1)
+                    payload["tab_closed"] = not cdp.target_exists(meta["page_id"])
+                except (cdp.CdpError, OSError):
+                    pass
+                if not payload["tab_closed"]:
+                    payload["warning"] = "图片已保存，但未确认本次标签页关闭"
+    return payload
+
+
+def positive(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("必须为正整数")
+    return number
+
+
+def main():
+    p = argparse.ArgumentParser(prog="cgimg", description="用已登录的 ChatGPT Web 出图（固定极高档）")
+    p.add_argument("prompt", help="要画什么")
+    p.add_argument("--out", default=".", help="输出目录或文件名，不覆盖现有文件")
+    p.add_argument("--style", help="图片风格")
+    p.add_argument("--aspect", help="画面比例，例如 16:9 / 1:1")
+    p.add_argument("--ref", action="append", metavar="图片", help="参考图，可重复")
+    p.add_argument("--note", help="原样追加自定义要求")
+    p.add_argument("--max", type=positive, default=4, help="最多保存几张，默认 4")
+    p.add_argument("--timeout", type=positive, default=600, help="等待出图上限秒数，默认 600")
+    p.add_argument("--interval", type=positive, default=6, help="轮询间隔秒数，默认 6")
+    p.add_argument("--keep-tab", action="store_true", help="成功后也保留标签页")
+    p.add_argument("--allow-model-drift", action="store_true", help="允许当前模型不在预期列表")
+    a = p.parse_args()
+    if not a.prompt.strip():
+        p.error("prompt 不能为空")
+    cwd = Path.cwd()
+    meta = {"id": "img-" + time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex(),
+            "repo": cwd, "t0": time.time(), "origin": detect_origin(cwd),
+            "subject": a.prompt.strip()[:200], "prompt": build_prompt(a),
+            "refs": [], "style": a.style, "aspect": a.aspect}
+    result = run(a, meta)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

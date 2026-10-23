@@ -37,6 +37,9 @@ jobs:
 
       - run: ./scripts/dryrun.sh
 
+      - name: 可选安装集成验证（不连接浏览器）
+        run: ./scripts/install-check.sh
+
   hygiene:
     name: 仓库卫生
     runs-on: ubuntu-latest
@@ -57,4 +60,4 @@ jobs:
       - name: 安装脚本可用
         run: |
           bash -n scripts/install.sh
-          HOME="$(mktemp -d)" bash scripts/install.sh || true   # 无 Chrome 环境下自检会报缺 CDP，只验不崩
+          bash -n scripts/install-check.sh

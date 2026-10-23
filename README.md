@@ -1,7 +1,7 @@
-# chatgpt-web-handoff (`cgh`)
+# chatgpt-web-handoff (`cgh` + `cgimg`)
 
-**Hand your coding agent's current context to the ChatGPT Web session already logged in
-in your everyday Chrome — and pull a structured verdict back into your repo.**
+**Use your existing ChatGPT Web session in your everyday Chrome for independent reviews
+and image generation, with results saved locally.**
 
 [简体中文](README.zh-CN.md)
 
@@ -20,10 +20,21 @@ stake in the code it's reviewing.
 ChatGPT tab over the Chrome DevTools Protocol, and parses the reply back into a
 `result.md` with `verdict` / `findings` / `recommended_actions`.
 
+`cgimg` uses the same browser connection to generate images, optionally from reference
+images, and saves the generated files locally. The two skills can be installed separately;
+both CLIs and their shared modules live in this repository.
+
 No browser extension. No Native Messaging. No broker service. No second Chrome profile.
 No credentials touched, stored, or moved — it drives the session you're already in.
 
 ---
+
+## v0.7.0 · 2026-10-23
+
+- **Two optional skills:** install `chatgpt-handoff`, `chatgpt-image-gen`, or both from one checkout. Image generation does not require the handoff skill to be installed.
+- **Shared browser code:** both CLIs use the same ChatGPT UI checks, raw CDP transport, origin/ledger helpers, and short browser lock around tier selection and sending.
+- **Image generation at xhigh:** `cgimg` supports style, aspect ratio and reference images, waits for generation, then saves the images and returns JSON paths.
+- **Preserved failure context:** image failures retain their own tab and report the page ID and conversation URL when known. An unconfirmed send is never automatically repeated.
 
 ## v0.6.0 · 2026-10-23
 
@@ -41,27 +52,35 @@ a deliberately unwritable ledger followed by repair in an isolated ledger.
 ## Quick start
 
 ```bash
-# 1. Chrome must expose the DevTools port. If it isn't already:
+# 1. Install either skill, or both. Installation does not need Chrome or Node.
+git clone https://github.com/sologuy/chatgpt-web-handoff.git
+cd chatgpt-web-handoff
+./scripts/install.sh                    # handoff only (backward-compatible default)
+# ./scripts/install.sh --skills image   # image generation only
+# ./scripts/install.sh --skills all     # both skills
+
+# 2. Before running either CLI, Chrome must expose the DevTools port:
 #    (quit Chrome first, then)
 open -a "Google Chrome" --args --remote-debugging-port=9222     # macOS
 # google-chrome --remote-debugging-port=9222                    # Linux
 
-# 2. Log into chatgpt.com in that Chrome, as you normally would.
-
-# 3. Install
-git clone https://github.com/sologuy/chatgpt-web-handoff.git
-cd chatgpt-web-handoff
-./scripts/install.sh
+# 3. Log into chatgpt.com in that Chrome, as you normally would.
 
 # 4. Check
 ./bin/cgh doctor
 ```
 
-`install.sh` symlinks the skill into `~/.claude/skills/`, `~/.agents/skills/` and
-`~/.codex/skills/` — so Claude Code, Codex and DSH all pick up the same copy.
+`install.sh --skills handoff|image|all` symlinks the selected skills into
+`~/.claude/skills/`, `~/.agents/skills/` and `~/.codex/skills/`, plus
+`~/.hermes/skills/` when `~/.hermes` already exists. Each harness reads the same source.
+It checks all selected targets before writing, refuses to overwrite real files or
+directories, and leaves unselected skills alone. For an isolated installation, set
+`CGH_INSTALL_HOME=/path/to/install-root`; this changes only the installation root.
 Requires **Python ≥ 3.9, stdlib only**. No pip install, no build step, no daemon.
+The optional `--register-mcp` flag requires Node, npx and Claude Code; that MCP is for
+diagnostics, and neither CLI needs it for normal use.
 
-## Use it
+## Use handoff
 
 The intended entry point is the skill — in Claude Code, Codex or DSH just say:
 
@@ -110,7 +129,38 @@ result must agree. Repeating the same repair adds no duplicate event.
 | `doctor` | Preflight: port reachable, logged in, tab found, tier readable |
 | `list` / `state` / `abort` / `confirm` / `parse` | Ledger and manual recovery |
 
-## What comes back
+## Generate images
+
+After installing with `--skills image` or `--skills all`, invoke the skill:
+
+```
+/chatgpt-image-gen  an orange cat on a wooden ladder in an old bookshop, afternoon light
+```
+
+Or use the CLI directly:
+
+```bash
+./bin/cgimg "An orange cat on a wooden ladder in an old bookshop" \
+  --style "photorealistic, shallow depth of field" --aspect 3:2 --out ./images
+
+./bin/cgimg "Paint this scene in watercolor" --ref ./reference.png --out ./images
+```
+
+`cgimg` uses **xhigh only** and waits in the foreground for generation and saving.
+The returned JSON lists saved files in `images[].path`. `--ref` is repeatable;
+`--note` appends an instruction, `--max` limits saved images, and `--timeout` / `--interval`
+control waiting. Use `--keep-tab` to retain the successful conversation. Model readback
+is checked; `--allow-model-drift` explicitly permits a model outside the expected list, without lowering
+the reasoning tier. See `./bin/cgimg --help` for the full parameter list.
+
+Failure keeps the tab created by that run and reports its page ID and conversation URL
+when available. **Do not blindly rerun after `send_unknown`, a generation timeout, or a
+download/save failure:** the original request may already be generating or complete.
+Inspect that conversation first. Only a successful run closes its own tab by default;
+other tabs are left alone. Check per-image errors as well as saved paths when downloads
+are incomplete.
+
+## What handoff returns
 
 `result.md` holds the **raw reply, unmodified**, plus a parsed block:
 
@@ -130,20 +180,22 @@ promoted to a certain one. If ChatGPT doesn't close with the required block, you
 ## How it works
 
 ```
-Your agent (Claude Code / Codex / DSH)
-   └─ skill: writes request.md — that's all it does
-        └─ cgh  (deterministic: job ledger, locks, tier control, parsing)
-             └─ raw CDP → 127.0.0.1:9222
-                  └─ your everyday Chrome, already logged into ChatGPT
-                       └─ artifacts land in <your repo>/.chatgpt/web-handoff/<job_id>/
+Your agent (Claude Code / Codex / DSH / Hermes)
+   ├─ chatgpt-handoff → cgh → request.md / result.md in your repo
+   └─ chatgpt-image-gen → cgimg → image files in --out
+        Both CLIs share:
+        cgh_common.py (origin, ledger, browser lock)
+        cgh_web.py (ChatGPT UI) → cgh_cdp.py (raw CDP)
+             → 127.0.0.1:9222 → your logged-in Chrome
 ```
 
 The browser choreography lives in **code, not in the prompt**. That's deliberate: a
 twenty-step flow with state transitions and branches is a state machine, and a prompt
 version of it can't be asserted, diffed, or regression-tested — it just quietly drifts.
 The reasoning behind each step lives in the code comments of `bin/cgh_web.py`.
+Handoff artifacts remain in `<your repo>/.chatgpt/web-handoff/<job_id>/`.
 
-## Guarantees it actually enforces
+## Handoff guarantees
 
 These are checked in code, not promised in a doc:
 
@@ -153,7 +205,7 @@ These are checked in code, not promised in a doc:
 - **Tier is read back** from the UI after being set, and re-verified immediately before
   send — the tier is an account-level preference that another tab can change under you.
 - **The model is verified**, not assumed (`CGH_EXPECTED_MODEL` to pin your own).
-- **Page allowlist.** Nothing is clicked unless the tab's host is `chatgpt.com`.
+- **Page allowlist.** Nothing is clicked unless the tab's host is `chatgpt.com` or `chat.openai.com`.
 - **Send is idempotent.** If the send fired but the conversation URL never appeared, you
   get `send_unknown` — a non-terminal state that refuses to auto-resend.
 - **Your instruction is frozen** with a sha256 and cross-checked, so an agent can't
@@ -171,9 +223,12 @@ These are checked in code, not promised in a doc:
   loudly at `effort_not_found`, listing the labels it actually saw — add yours to
   `EFFORT_LABELS`.
 - **No unit tests.** Verification here is real runs; a dry run cannot exercise the half
-  of this that lives in a browser. Ship changes by re-running an actual low-tier job.
-- **Single active job per repo**, enforced by a lockfile. Different repos run in parallel;
-  a machine-wide lock guards only the one-second `set tier → send` window.
+  of this that lives in a browser. Changes to `bin/` require a real low-tier handoff and
+  image generation, including a reference-image run.
+- **Single active handoff job per repo**, enforced by a lockfile. Both CLIs share
+  `~/.cgh/browser.lock` only for tier selection, model/tier verification, sending and
+  confirmation. Uploads, generation and downloads are outside that lock. It does not
+  provide batch or concurrency scheduling.
 - **This is a personal, local, low-frequency tool.** It is not a ChatGPT API replacement,
   not a shared service, not for batch work. Automating a web session may sit awkwardly
   with your provider's terms — that call, and its consequences, are yours.

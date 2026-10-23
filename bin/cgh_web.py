@@ -69,13 +69,23 @@ class EffortNotFound(CdpError):
 
 # ---------------------------------------------------------------- JS 片段
 
+_COMPOSER = """(() => {
+  const visible = e => { const r = e.getBoundingClientRect(); return getComputedStyle(e).visibility !== 'hidden' && r.width > 0 && r.height > 0; };
+  const named = [...document.querySelectorAll('[role="textbox"][contenteditable="true"]')].find(e =>
+    /^(询问 ChatGPT|Ask ChatGPT|Message ChatGPT)$/.test(e.getAttribute('aria-label') || '')
+    && e.closest('form') && visible(e));
+  return named || [...document.querySelectorAll('#prompt-textarea,[data-composer-markdown]')]
+    .find(e => e.closest('form') && visible(e)) || null;
+})()"""
+
 _EFFORT_BTN = """(() => {
-  const visible = b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const visible = b => { const r = b.getBoundingClientRect(); return getComputedStyle(b).visibility !== 'hidden' && r.width > 0 && r.height > 0; };
   // 2026-10-08：对话页保留隐藏的首页 form；先按无障碍名称找可见按钮。
   const named = [...document.querySelectorAll('button,[role="button"]')].find(b =>
     /^(选择 ChatGPT 模型|Choose ChatGPT model|Select ChatGPT model)$/.test(b.getAttribute('aria-label') || '') && visible(b));
   if (named) return named;
-  const form = document.querySelector('form');
+  const composer = """ + _COMPOSER + """;
+  const form = composer && composer.closest('form');
   if (!form) return null;
   const btns = [...form.querySelectorAll('button[aria-haspopup="menu"]')]
     .filter(b => b.getAttribute('data-testid') !== 'composer-plus-btn' && visible(b));
@@ -84,16 +94,18 @@ _EFFORT_BTN = """(() => {
 
 _SEND_BTN = """(() => {
   // 与档位按钮一样，先排除隐藏首页 form 中的同名发送按钮。
-  const visible = b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const visible = b => { const r = b.getBoundingClientRect(); return getComputedStyle(b).visibility !== 'hidden' && r.width > 0 && r.height > 0; };
   const named = [...document.querySelectorAll('button,[role="button"]')].find(b =>
     /^(发送|Send prompt)$/.test(b.getAttribute('aria-label') || '') && visible(b));
   return named || [...document.querySelectorAll('[data-testid="send-button"]')].find(visible) || null;
 })()"""
 
 _STOP_BTN = """(() => {
-  // 完成后隐藏 form 仍可残留停止按钮，只有可见按钮才表示仍在生成。
-  return [...document.querySelectorAll('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]')]
-    .find(b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }) || null;
+  // Pro 的停止按钮可出现在 form 外；完成后隐藏表单又会残留旧按钮。
+  const visible = b => { const r = b.getBoundingClientRect(); return getComputedStyle(b).visibility !== 'hidden' && r.width > 0 && r.height > 0; };
+  const named = [...document.querySelectorAll('button,[role="button"]')].find(b =>
+    /^(停止|停止生成|Stop|Stop generating|Stop response)$/.test(b.getAttribute('aria-label') || '') && visible(b));
+  return named || [...document.querySelectorAll('[data-testid="stop-button"]')].find(visible) || null;
 })()"""
 
 _PICKER = '[data-testid="composer-intelligence-picker-content"], [role="menu"]:has([role="slider"])'
@@ -102,6 +114,13 @@ _PICKER = '[data-testid="composer-intelligence-picker-content"], [role="menu"]:h
 # 无障碍说话人标题。必须按消息边界取正文，不能从 body 截字符串：用户提示词
 # 本身就带本轮哨兵，把它当助手回复会在生成前错误地判定完成。
 _MESSAGES_JS = r"""
+    const _visible = e => {
+            const s = getComputedStyle(e), r = e.getBoundingClientRect();
+            if (s.visibility === 'hidden' || s.display === 'none') return false;
+            // 图片回合用 display:contents 包装，容器无矩形，但内容仍可见。
+            return (r.width > 0 && r.height > 0)
+                || (s.display === 'contents' && [...e.children].some(_visible));
+    };
     const _messages = role => {
         const name = role === 'assistant' ? /^(ChatGPT 说：|ChatGPT said:)$/
                                          : /^(你说：|You said:)$/;
@@ -110,14 +129,15 @@ _MESSAGES_JS = r"""
         const modern = headings.filter(h => role === 'assistant'
             ? h.getAttribute('data-conversation-role') === 'assistant'
             : h.nextElementSibling?.querySelector('[data-user-message-bubble]'));
-        if (modern.length) return modern.map(h => role === 'assistant'
-            ? h.parentElement : h.nextElementSibling);
-        return [...document.querySelectorAll('[data-message-author-role="' + role + '"]')];
+        const rendered = modern.map(h => role === 'assistant'
+            ? h.parentElement : h.nextElementSibling).filter(_visible);
+        if (rendered.length) return rendered;
+        return [...document.querySelectorAll('[data-message-author-role="' + role + '"]')].filter(_visible);
     };
     const _messageText = el => {
         if (!el) return '';
-        const heading = el.firstElementChild;
-        if (heading?.getAttribute('data-conversation-role') === 'assistant') {
+        const heading = [...el.children].find(e => e.getAttribute('data-conversation-role') === 'assistant');
+        if (heading) {
             return [...el.children].filter(e => e !== heading)
                 .map(e => e.innerText).join('\n').trim();
         }
@@ -148,7 +168,7 @@ def guard_host(page):
 
 def check_login(page):
     return page.evaluate(
-        "!/\\/auth|\\/login/.test(location.pathname) && !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))"
+        "!/\\/auth|\\/login/.test(location.pathname) && !!" + _COMPOSER + ""
     )
 
 
@@ -179,8 +199,8 @@ def _find_blank_chat(owned_ids=()):
             page = cdp.attach(p["id"])
             clean = page.evaluate(
                 "(() => {" + _MESSAGES_JS + " return _messageCount() === 0"
-                " && !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))"
-                " && (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')).innerText.trim() === ''; })()"
+                " && !!" + _COMPOSER + ""
+                " && " + _COMPOSER + ".innerText.trim() === ''; })()"
             )
             if clean and (count_chips(page) or count_uploads(page)):
                 clean = False          # 有遗留附件或上传件，这页不能用
@@ -214,7 +234,7 @@ def open_new_chat(timeout=PAGE_TIMEOUT, owned_ids=(), on_page=None):
         # 主线程忙不会误判，反过来省掉后面每一次 evaluate 都要自己扛超时。
         page.unfreeze()
         guard_host(page)
-        _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout)
+        _wait(page, "!!" + _COMPOSER + "", "输入框就绪", timeout)
         _wait(page, f"(() => {{ const b = {_EFFORT_BTN}; return !!b && b.getBoundingClientRect().width > 0; }})()",
               "档位按钮就绪", timeout)
         if not check_login(page):
@@ -425,7 +445,7 @@ _CHIPS_JS = """
     // 输入框可能还没渲染出来（续聊时接上已有对话页尤其常见）。
     // 不判空的话这里直接抛 TypeError: ... reading 'closest'，
     // 而调用方看到的是一个跟 DOM 完全不沾边的报错，很难往「页面没加载完」上想。
-    const _composer = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
+    const _composer = """ + _COMPOSER + """;
     const _form = (_composer && _composer.closest('form')) || document.body;
     const _hit = e => /在文本字段中显示|Show in text field/.test(e.textContent);
     const chips = () => [..._form.querySelectorAll('*')]
@@ -440,7 +460,7 @@ _CHIPS_JS = """
 # 另外整段正文只落在一个 <p> 里，换行是 <br>，所以不能按段落切。
 _TEXT_JS = r"""
     const _logical = () => {
-        const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
+        const el = """ + _COMPOSER + r""";
         if (!el) return '';
         const out = [];
         const walk = n => {
@@ -459,7 +479,7 @@ _TEXT_JS = r"""
 """
 
 _PASTE_JS = """
-    const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
+    const el = """ + _COMPOSER + """;
     if (!el) return {ok: false, why: 'no_composer'};
 """ + _TEXT_JS + _CHIPS_JS + _MESSAGES_JS + """
     const before = _messageCount();
@@ -506,7 +526,7 @@ _PASTE_JS = """
 # 附件卡片上没有移除键，唯一的出路是点「在文本字段中显示」把它还原成内联文本再删。
 _DROP_CHIPS_JS = """
 """ + _TEXT_JS + _CHIPS_JS + """
-    const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
+    const el = """ + _COMPOSER + """;
     if (!el) return {chips: chips(), composer: -1, why: 'no_composer'};
     for (let i = 0; i < 6 && chips() > 0; i++) {
         const btn = [..._form.querySelectorAll('button,[role=button]')].find(
@@ -532,7 +552,9 @@ _DROP_CHIPS_JS = """
 # 卡片本身只有 tailwind 生成的 class，改版必变，不能用。
 # 2026-10-10 实测新版改成「移除 a.docx」（空格 + 文件名、无引号），按带扩展名的文件名认。
 _UPLOADS_JS = """
-    const _upBtns = () => [...document.querySelectorAll('button,[role=button]')]
+    const _upComposer = """ + _COMPOSER + """;
+    const _upForm = _upComposer && _upComposer.closest('form');
+    const _upBtns = () => (_upForm ? [..._upForm.querySelectorAll('button,[role=button]')] : [])
         .filter(b => /^(移除文件|Remove file|移除[“"]|Remove [“"])/.test(b.getAttribute('aria-label') || '')
                   || /^(移除|Remove) .+\\.[A-Za-z0-9]{1,8}$/.test(b.getAttribute('aria-label') || ''));
     const _upNames = () => _upBtns().map(
@@ -545,8 +567,7 @@ _UPLOADS_JS = """
 # 续聊页会保留另一份隐藏 form；全页第一个通用文件框可能属于它，上传后没有卡片。
 # 只取实际 composer 所属 form，再挑 accept 最宽的文件框，不维护类型白名单。
 _FILE_INPUT = """(() => {
-    const composer = document.querySelector('#prompt-textarea') ||
-        document.querySelector('div.ProseMirror[contenteditable=true]');
+    const composer = """ + _COMPOSER + """;
     const form = composer && composer.closest('form');
     return form ? [...form.querySelectorAll('input[type=file]')]
         .sort((a, b) => (a.accept ? 1 : 0) - (b.accept ? 1 : 0))[0] : null;
@@ -665,7 +686,7 @@ def reuse_pending_chat(pending, timeout=PAGE_TIMEOUT):
     try:
         page = cdp.attach(target_id)
         guard_host(page)
-        _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))",
+        _wait(page, "!!" + _COMPOSER + "",
               "输入框就绪", timeout)
         state = inspect_draft_state(page)
         safe = state["root_path"] and state["has_composer"] and not state["messages"] and not state["generating"]
@@ -804,7 +825,7 @@ def send(page, confirm=12):
     只有全部证据都不成立、且 send 按钮还在，才允许换一种方式再点一次。
     """
     _SENT_JS = "(() => {" + _MESSAGES_JS + """
-        const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
+        const el = """ + _COMPOSER + """;
         return JSON.stringify({
             len: el ? el.innerText.trim().length : -1,
             users: _messages('user').length,
@@ -918,7 +939,7 @@ _PROGRESS_JS = "(() => {" + _MESSAGES_JS + """
     has_messages: a.length + u.length > 0,
     // 结构探针：这两个锚点是「页面还是我们认识的样子」的证据。
     // 没有它们时，stop-button 缺失只能说明「选择器可能变了」，不能推出「生成完了」。
-    has_composer: !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')),
+    has_composer: !!""" + _COMPOSER + """,
     has_send_btn: !!(""" + _SEND_BTN + """),
     len: t.length,
     tail: t.slice(-1200),
@@ -960,6 +981,65 @@ def read_full(page):
     return page.evaluate(_FULL_JS, timeout=120)
 
 
+_IMAGE_URL_JS = r"""
+    const _imageURL = src => {
+      try {
+        const u = new URL(src, location.href);
+        return (u.protocol === 'blob:' && u.origin === location.origin)
+          || (u.origin === location.origin && /^\/backend-api\/(estuary|files)\//.test(u.pathname));
+      } catch (_) { return false; }
+    };
+"""
+
+
+def read_image_state(page, before=(), min_side=256, max_images=None):
+    """在同一次求值中读取共享生成状态与助手图片，避免把参考图当成结果。"""
+    guard_host(page)
+    return page.call_fn("return (() => {" + _MESSAGES_JS + _IMAGE_URL_JS + """
+      const progress = """ + _PROGRESS_JS + """;
+      const excluded = new Set(ARG.before);
+      _messages('user').forEach(m => m.querySelectorAll('img').forEach(i => excluded.add(i.src)));
+      const candidates = new Map();
+      const rank = i => i.complete
+        ? (i.naturalWidth >= ARG.min && i.naturalHeight >= ARG.min ? 2 : 0) : 1;
+      _messages('assistant').forEach(m => m.querySelectorAll('img').forEach(i => {
+        const generated = _imageURL(i.src)
+          && (!/^blob:/.test(i.src || '') || /^(已生成(图片|图像)|Generated image)/.test(i.alt || ''));
+        if (!generated || excluded.has(i.src) || !_visible(i)) return;
+        // 同 src 的灯箱/缩略图可共存，不能用尚未加载的副本覆盖完整图片。
+        const old = candidates.get(i.src);
+        if (!old || rank(i) > rank(old)) candidates.set(i.src, i);
+      }));
+      const usable = [...candidates.values()].filter(i => !i.complete || !i.naturalWidth
+        || !i.naturalHeight || (i.naturalWidth >= ARG.min && i.naturalHeight >= ARG.min));
+      const selected = ARG.max === null ? usable : usable.slice(0, ARG.max);
+      const images = selected.flatMap((i, n) =>
+        i.complete && i.naturalWidth >= ARG.min && i.naturalHeight >= ARG.min
+          ? [{src: i.src, w: i.naturalWidth, h: i.naturalHeight, index: n + 1}] : []);
+      return {...progress, images, images_available: usable.length,
+        failed_images: selected.flatMap((i, n) => i.complete && (!i.naturalWidth || !i.naturalHeight)
+          ? [{index: n + 1, error: 'image_load_failed', message: '页面图片加载失败'}] : []),
+        pending_images: selected.filter(i => !i.complete).length};
+    })();""", {"before": list(before), "min": min_side, "max": max_images})
+
+
+def fetch_image(page, src):
+    """仅在原 ChatGPT 页面内取图，不读取或持久化凭证。"""
+    guard_host(page)
+    return page.call_fn("return (async () => {" + _IMAGE_URL_JS + """
+      const u = new URL(ARG.src, location.href);
+      if (!_imageURL(ARG.src))
+        return {ok: false, why: 'image_url_not_allowed'};
+      const r = await fetch(u.href, {credentials: 'same-origin'});
+      if (!r.ok) return {ok: false, why: 'http_' + r.status};
+      const buf = new Uint8Array(await r.arrayBuffer());
+      let s = ''; const chunk = 0x8000;
+      for (let i = 0; i < buf.length; i += chunk)
+        s += String.fromCharCode(...buf.subarray(i, i + chunk));
+      return {ok: true, type: r.headers.get('content-type') || '', b64: btoa(s)};
+    })();""", {"src": src}, timeout=180)
+
+
 def save_failed_page(page, directory):
     snapshot = page.call('Accessibility.getFullAXTree', {})
     (directory / 'failed-snapshot.txt').write_text(
@@ -977,7 +1057,7 @@ def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT, on_reopen=No
             guard_host(page)
             # 复用的标签页也要确认输入框在——它可能刚被导航走又回来，
             # 或者页面还在重建。不等就会在后面注入时撞上空的 composer。
-            _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout)
+            _wait(page, "!!" + _COMPOSER + "", "输入框就绪", timeout)
             return page, page_id, False
         except Exception:
             if page:
@@ -994,7 +1074,7 @@ def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT, on_reopen=No
         # 看起来跟「已完成但没输出」一模一样，会误判。
         _wait(page, "(() => {" + _MESSAGES_JS + " return _messageCount() > 0; })()",
               "会话消息渲染", timeout=timeout)
-        _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout=timeout)
+        _wait(page, "!!" + _COMPOSER + "", "输入框就绪", timeout=timeout)
     except Exception:
         page.close()          # 只断 WS，标签页留着给人看现场
         raise
