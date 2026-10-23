@@ -24,6 +24,17 @@
 
 ---
 
+## v0.6.0 · 2026-10-23
+
+`main` 是交付分支：通过验证的改动都会合并并推送到这里。需要固定版本时，使用发布 tag。
+
+- **续聊可追加新附件**：用 `continue --from … --attach …`，继续同一个 ChatGPT 对话。
+- **UI 适配与页面恢复**：支持模型回读、中英文档位标签、可见控件定位，以及经核对的未发送草稿恢复；深度自检会回收自身空白页。2026-10-23 真实提交回读为 **GPT-6 / Instant**，同时保留中文档位别名。
+- **审查历史留痕**：可识别时记录发起 agent/会话；用 `outcome` 登记采纳决定，追加式账本保留历次更新。
+- **统计修正与安全补漏**：`stats --json` 只输出 JSON，按集合差计算已完成但未处置的作业；`backfill --dry-run` 预览缺失事件，`--id` / `--event` 限定补写范围。账本写失败会明确告警，不因此重投 handoff。
+
+本次发布代码通过了 **25 项干跑与真实浏览器提交**，包括故意让账本不可写、再在隔离账本补漏的验证。
+
 ## 快速开始
 
 ```bash
@@ -70,13 +81,28 @@ $CGH outcome --id <job_id> --status adopted --note "哪条建议真有用、哪�
 
 `wait` 会自己轮询——不用有人守着问「好了没」。
 
+续聊时补充文件，或查看、修复账本：
+
+```bash
+$CGH continue --from <previous_job_id> --attach ./supplement.pdf -- "请审查新增证据"
+# 填新作业的 request.md，再用返回的子作业 job_id 提交并等待结果。
+$CGH stats --json
+$CGH backfill --dry-run --id <job_id> --event completed
+# 核对预览后再执行：
+$CGH backfill --id <job_id> --event completed
+```
+
+补漏保留原事件时间，不改 job/result 原件，也不推断 outcome。完成事件必须有合法结果块；
+原始回答存在时，两者解析结果须一致。重复执行相同补漏不会追加重复事件。
+
 | 命令 | 作用 |
 |---|---|
-| `new` / `continue` | 建作业 / 在**同一个** ChatGPT 对话里追问 |
+| `new` / `continue` | 建作业 / 在**同一个** ChatGPT 对话里追问，可追加本轮附件 |
 | `submit` | 上传附件、选推理档位、注入正文、发送、拿到对话 URL |
 | `poll` / `wait` | 读一次进度 / 阻塞到裁决解析完成 |
 | `outcome` | 记下建议有没有被采纳——这是唯一能让它进化的信号 |
-| `stats` | 跨仓统计：档位性价比、发起方分布、采纳率 |
+| `stats` | 跨仓账本统计；`--json` 输出机器可读的汇总和明细 |
+| `backfill` | 预览或补写缺失的创建/完成事件；支持 `--dry-run`、`--id`、`--event` |
 | `doctor` | 开工自检：端口通不通、登没登录、找不找得到标签页、档位读不读得到 |
 | `list` / `state` / `abort` / `confirm` / `parse` | 账本与手工兜底 |
 

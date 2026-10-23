@@ -39,9 +39,13 @@
 
 | 分支 | 用途 |
 |------|------|
-| `main` | 稳定基线，只接受合并 + tag |
+| `main` | 默认交付分支，接收已验证改动的合并；里程碑打 tag |
 | `dev` | 日常工作分支 |
 | `task/<name>` | 跨多日或有风险的任务 |
+
+完成的改动必须在验证通过后合并到 `main` 并推送 `origin/main`，核对远端 SHA。
+开发可以使用 `dev` 或 `task/*`，但不能只推任务分支就报告交付完成。
+发布时同步更新中英文 README 和仓库描述；打 tag 时使用带说明的 tag，指向 `main` 的已验证合并提交。
 
 commit 格式：`<type>: <中文摘要>`，type ∈ `docs` / `feat` / `fix` / `chore` / `design`。
 提交前 `git status --short` 审查，确认没有凭证、没有 `.env`、
