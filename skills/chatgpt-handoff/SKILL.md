@@ -162,6 +162,8 @@ $CGH outcome --id <job_id> --status adopted|partial|rejected \
 
 ```bash
 $CGH continue --from <上一轮的 job_id> -- <这轮要追问什么>
+# 本轮补充原文或图片（最多10个，只上传本轮指定文件）：
+$CGH continue --from <上一轮的 job_id> --attach ./supplement.pdf -- <这轮要追问什么>
 # 然后照常填 request.md，再 $CGH submit --id <新 job_id>
 ```
 
@@ -170,6 +172,7 @@ $CGH continue --from <上一轮的 job_id> -- <这轮要追问什么>
 - 每次追问建一个**子作业**（自己的 job_id / request.md / result.md / 哨兵），
   用 `parent_id` 串成链。这样每一轮的裁决都留得下，不会被下一轮覆盖。
 - 档位默认继承父作业；追问内容里点了别的档位就按它。
+- `--attach`沿用新建作业的路径、数量及上传校验；不重复上传父轮附件。补充上下文须说明新增附件的阅读任务。
 - 父作业必须已有 `conversation_url`（即至少提交过一次）。
 
 ## 其他命令
@@ -184,10 +187,17 @@ $CGH confirm --id <id> --url <对话URL>        # 人工确认「那一发确实
 $CGH parse --id <id> --from <原文文件>        # 手工兜底：从已保存的原文解析
 $CGH outcome --id <id> --status adopted|partial|rejected --note "..."   # 记结论的下场
 $CGH stats                                   # 跨仓统计（档位性价比 / 发起方 / 采纳率）
-$CGH backfill                                # 把本仓库已有作业补进全机账本（幂等）
+$CGH stats --json                            # 纯 JSON；summary 按账本事件集合统计
+$CGH backfill --dry-run                      # 只预览本仓库缺失的 created/completed 事件
+$CGH backfill --id <id> --event completed     # 精确补一条完成事件；--id / --event 可重复
+$CGH backfill                                # 补本仓库缺失事件（按 id + 事件查重）
 ```
 
-模型固定 `GPT-5.6 Sol`，每次 submit 都会实测回读。本 Skill 只调推理强度，不切模型。
+补漏先看 `--dry-run` 的 `events` 和 `rejected`。完成事件须有 completed 状态、原完成时间、
+有效结果哨兵；原始回答存在时还须解析一致。补漏不改原件、不推断 outcome。
+账本写失败会向 stderr 告警；已发送的 handoff 不因此重投，核对后再补漏。
+
+模型必须在 `bin/cgh_web.py` 的 `EXPECTED_MODELS` 允许列表内（当前包含 `GPT-6`），每次 submit 都会实测回读。本 Skill 只调推理强度，不切模型。
 
 **并发**：作业闸门是按仓库算的，不同仓库可以同时跑，互不阻塞。
 但 ChatGPT 的推理强度是账号级共享偏好，所以 `cgh` 在「设档位 → 发送」这一两秒上加了全机互斥。
@@ -205,7 +215,7 @@ $CGH backfill                                # 把本仓库已有作业补进全
 | `remote_debug_denied` | 连不上 9222 | 提示 `open -a "Google Chrome" --args --remote-debugging-port=9222`，**不要擅自重启用户的 Chrome** |
 | `auth_required` | ChatGPT 未登录 | 请用户在浏览器里登录后重试 |
 | `effort_not_found` | 档位标签对不上（通常是界面语言变了） | 把 `effort_available` 里的实际选项列给用户，让他选 |
-| `model_changed` | 模型不是钉死的那个 | 报出实测模型名。确认要跟进就改 `bin/cgh_web.py` 的 `EXPECTED_MODEL` |
+| `model_changed` | 模型不在允许列表内 | 报出实测模型名。确认要跟进就改 `bin/cgh_web.py` 的 `EXPECTED_MODELS` |
 | `wrong_page` | 目标页不是 chatgpt.com | 直接报告，不要试探 |
 | `ui_changed` | 元素定位失败 / 等待超时 | ChatGPT 改版了，报告并停下 |
 | `ui_changed` + `background_unfreeze_failed` | 后台标签页解冻失效 | 不是改版。报告 Chrome 版本，别重试——页面已停止渲染，读到的都是旧值 |

@@ -25,6 +25,19 @@ No credentials touched, stored, or moved — it drives the session you're alread
 
 ---
 
+## v0.6.0 · 2026-10-23
+
+`main` is the delivery branch: verified changes are merged and pushed there. Use a
+release tag when you need a fixed version.
+
+- **Follow-ups can attach new files** with `continue --from … --attach …`, while keeping the same ChatGPT conversation.
+- **UI compatibility and page recovery:** model readback, Chinese/English tier labels, visible controls, and verified unsent-draft recovery. Deep preflight cleans up its own empty tab. The 2026-10-23 live run read back **GPT-6 / Instant**; Chinese tier names remain supported aliases.
+- **Review history:** jobs record their originating agent/session when available; `outcome` records adoption decisions and retains updates in the append-only ledger.
+- **Correct statistics and safe repair:** `stats --json` emits only JSON and counts completed jobs without an outcome by set difference. `backfill --dry-run` previews missing events; `--id` and `--event` limit what is repaired. Ledger write failures are reported without resending a handoff.
+
+The release code passed the **25-check dry run and a real browser submission**, including
+a deliberately unwritable ledger followed by repair in an isolated ledger.
+
 ## Quick start
 
 ```bash
@@ -71,13 +84,29 @@ $CGH outcome --id <job_id> --status adopted --note "which advice was gold, which
 
 `wait` polls for you — you don't sit there asking "is it done yet".
 
+Follow up with another file, or inspect and repair the ledger:
+
+```bash
+$CGH continue --from <previous_job_id> --attach ./supplement.pdf -- "Review the new evidence"
+# Fill the new request.md, then submit and wait using the returned child job_id.
+$CGH stats --json
+$CGH backfill --dry-run --id <job_id> --event completed
+# After checking the preview:
+$CGH backfill --id <job_id> --event completed
+```
+
+Backfill preserves original event times and does not modify job/result files or infer
+outcomes. A completion needs a valid result block; when the raw reply exists, its parsed
+result must agree. Repeating the same repair adds no duplicate event.
+
 | Command | What it does |
 |---|---|
-| `new` / `continue` | Create a job / follow up in the *same* ChatGPT conversation |
+| `new` / `continue` | Create a job / follow up in the *same* ChatGPT conversation, with optional new attachments |
 | `submit` | Upload attachments, pick the reasoning tier, inject the body, send, capture the conversation URL |
 | `poll` / `wait` | Read progress once / block until the verdict is parsed |
 | `outcome` | Record whether the advice was adopted — the only signal that lets this improve |
-| `stats` | Cross-repo stats: tier cost/benefit, who initiated, adoption rate |
+| `stats` | Cross-repo ledger statistics; `--json` emits a machine-readable summary and detail |
+| `backfill` | Preview or append missing created/completed events; supports `--dry-run`, `--id`, and `--event` |
 | `doctor` | Preflight: port reachable, logged in, tab found, tier readable |
 | `list` / `state` / `abort` / `confirm` / `parse` | Ledger and manual recovery |
 

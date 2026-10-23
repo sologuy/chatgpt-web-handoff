@@ -6,10 +6,13 @@
 - 发送后 URL 要等到服务端真 id，中间会短暂停在 /c/WEB:<临时id>
 """
 
+import base64
+import hashlib
 import json
 import os
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import cgh_cdp as cdp
 from cgh_cdp import CdpError
@@ -23,8 +26,9 @@ CHATGPT_HOSTS = {"chatgpt.com", "chat.openai.com"}
 # 不是具体模型名。所以这里从「钉死一个名字」改成「一组允许的选中项」：
 # 仍然能发现「账号被切到别的模型」，但不会因为官方把默认项改成别名就每次都拦。
 # 实测到的原值照旧记进 job.json，审计链不受影响。
+# 2026-10-08 实测当前选中项为 GPT-6，经用户确认纳入允许列表。
 EXPECTED_MODELS = [x.strip() for x in
-                   os.environ.get("CGH_EXPECTED_MODEL", "最新,Latest,GPT-5.6 Sol").split(",")
+                   os.environ.get("CGH_EXPECTED_MODEL", "最新,Latest,GPT-5.6 Sol,GPT-6").split(",")
                    if x.strip()]
 EXPECTED_MODEL = EXPECTED_MODELS[0]          # 报错文案用
 
@@ -37,7 +41,7 @@ EXPECTED_MODEL = EXPECTED_MODELS[0]          # 报错文案用
 PAGE_TIMEOUT = int(os.environ.get("CGH_PAGE_TIMEOUT", "150"))
 
 # 每档的标签候选。中文项是 2026-08-19 实测（界面语言 zh-CN）；
-# 英文项未实测，只作候选——命中不了照样置 effort_not_found 停下问人，不静默降级。
+# 2026-10-08 实测英文五档 Instant / Medium / High / Extra High / Pro；其他别名仍只作候选。
 # 首项是"想要的那个"，用于日志与回读比对。
 EFFORT_LABELS = {
     "instant": ["即时", "极速", "Instant"],
@@ -66,14 +70,61 @@ class EffortNotFound(CdpError):
 # ---------------------------------------------------------------- JS 片段
 
 _EFFORT_BTN = """(() => {
+  const visible = b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  // 2026-10-08：对话页保留隐藏的首页 form；先按无障碍名称找可见按钮。
+  const named = [...document.querySelectorAll('button,[role="button"]')].find(b =>
+    /^(选择 ChatGPT 模型|Choose ChatGPT model|Select ChatGPT model)$/.test(b.getAttribute('aria-label') || '') && visible(b));
+  if (named) return named;
   const form = document.querySelector('form');
   if (!form) return null;
   const btns = [...form.querySelectorAll('button[aria-haspopup="menu"]')]
-    .filter(b => b.getAttribute('data-testid') !== 'composer-plus-btn');
+    .filter(b => b.getAttribute('data-testid') !== 'composer-plus-btn' && visible(b));
   return btns.length ? btns[btns.length - 1] : null;
 })()"""
 
-_PICKER = '[data-testid="composer-intelligence-picker-content"]'
+_SEND_BTN = """(() => {
+  // 与档位按钮一样，先排除隐藏首页 form 中的同名发送按钮。
+  const visible = b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const named = [...document.querySelectorAll('button,[role="button"]')].find(b =>
+    /^(发送|Send prompt)$/.test(b.getAttribute('aria-label') || '') && visible(b));
+  return named || [...document.querySelectorAll('[data-testid="send-button"]')].find(visible) || null;
+})()"""
+
+_STOP_BTN = """(() => {
+  // 完成后隐藏 form 仍可残留停止按钮，只有可见按钮才表示仍在生成。
+  return [...document.querySelectorAll('[data-testid="stop-button"], form button[aria-label*="停止"], form button[aria-label*="Stop"]')]
+    .find(b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }) || null;
+})()"""
+
+_PICKER = '[data-testid="composer-intelligence-picker-content"], [role="menu"]:has([role="slider"])'
+
+# 2026-09-29：新版移除了 data-message-author-role 与 article，但保留了
+# 无障碍说话人标题。必须按消息边界取正文，不能从 body 截字符串：用户提示词
+# 本身就带本轮哨兵，把它当助手回复会在生成前错误地判定完成。
+_MESSAGES_JS = r"""
+    const _messages = role => {
+        const name = role === 'assistant' ? /^(ChatGPT 说：|ChatGPT said:)$/
+                                         : /^(你说：|You said:)$/;
+        const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')]
+            .filter(h => name.test((h.getAttribute('aria-label') || h.textContent).trim()));
+        const modern = headings.filter(h => role === 'assistant'
+            ? h.getAttribute('data-conversation-role') === 'assistant'
+            : h.nextElementSibling?.querySelector('[data-user-message-bubble]'));
+        if (modern.length) return modern.map(h => role === 'assistant'
+            ? h.parentElement : h.nextElementSibling);
+        return [...document.querySelectorAll('[data-message-author-role="' + role + '"]')];
+    };
+    const _messageText = el => {
+        if (!el) return '';
+        const heading = el.firstElementChild;
+        if (heading?.getAttribute('data-conversation-role') === 'assistant') {
+            return [...el.children].filter(e => e !== heading)
+                .map(e => e.innerText).join('\n').trim();
+        }
+        return el.innerText;
+    };
+    const _messageCount = () => _messages('assistant').length + _messages('user').length;
+"""
 
 
 def _wait(page, expr, what, timeout=20, interval=0.3):
@@ -97,7 +148,7 @@ def guard_host(page):
 
 def check_login(page):
     return page.evaluate(
-        "!/\\/auth|\\/login/.test(location.pathname) && !!document.querySelector('#prompt-textarea')"
+        "!/\\/auth|\\/login/.test(location.pathname) && !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))"
     )
 
 
@@ -127,9 +178,9 @@ def _find_blank_chat(owned_ids=()):
         try:
             page = cdp.attach(p["id"])
             clean = page.evaluate(
-                "(() => document.querySelectorAll('[data-message-author-role]').length === 0"
-                " && !!document.querySelector('#prompt-textarea')"
-                " && document.querySelector('#prompt-textarea').innerText.trim() === '')()"
+                "(() => {" + _MESSAGES_JS + " return _messageCount() === 0"
+                " && !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))"
+                " && (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')).innerText.trim() === ''; })()"
             )
             if clean and (count_chips(page) or count_uploads(page)):
                 clean = False          # 有遗留附件或上传件，这页不能用
@@ -143,21 +194,27 @@ def _find_blank_chat(owned_ids=()):
     return None, None
 
 
-def open_new_chat(timeout=PAGE_TIMEOUT, owned_ids=()):
+def open_new_chat(timeout=PAGE_TIMEOUT, owned_ids=(), on_page=None):
     """开一个干净的新会话页，绝不复用用户已有的对话页。
 
-    owned_ids 是本仓库历史作业用过的 targetId，只在这个集合里找可复用的空白页。
+    owned_ids 仅限调用方当前作业的 targetId，不跨作业回收历史页面。
     """
     page, target_id = _find_blank_chat(owned_ids)
     if page is None:
-        page, target_id = cdp.open_page("https://chatgpt.com/", timeout=timeout)
+        page, target_id = cdp.open_page("https://chatgpt.com/", timeout=timeout, on_created=on_page)
+    elif on_page:
+        try:
+            on_page(target_id)
+        except Exception:
+            page.close()
+            raise
     try:
         # 后台新标签页会被 Chrome 立刻降频（页面一多尤其明显），第一次 evaluate
         # 可能直接超时而不是返回慢。所以先把它唤醒——unfreeze 自带 30s 预算和重试，
         # 主线程忙不会误判，反过来省掉后面每一次 evaluate 都要自己扛超时。
         page.unfreeze()
         guard_host(page)
-        _wait(page, "!!document.querySelector('#prompt-textarea')", "输入框就绪", timeout)
+        _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout)
         _wait(page, f"(() => {{ const b = {_EFFORT_BTN}; return !!b && b.getBoundingClientRect().width > 0; }})()",
               "档位按钮就绪", timeout)
         if not check_login(page):
@@ -203,7 +260,7 @@ _SLIDER_CTRL = f"""(() => {{
   const g = document.querySelector('{_PICKER}');
   if (!g) return null;
   return [...g.querySelectorAll('[role=menuitem]')]
-    .find(e => /^(能力|Capability)$/i.test(e.getAttribute('aria-label') || '')) || null;
+    .find(e => /^(能力|强度|Capability|Intensity|Effort)$/i.test(e.getAttribute('aria-label') || '')) || null;
 }})()"""
 
 # 当前档位读 aria-describedby 指向的实时描述：「极高，第 4 项，共 5 项。」
@@ -213,7 +270,7 @@ _EFFORT_STATE = f"""(() => {{
   if (!g) return null;
   const s = g.querySelector('[role=slider]');
   const c = [...g.querySelectorAll('[role=menuitem]')]
-    .find(e => /^(能力|Capability)$/i.test(e.getAttribute('aria-label') || ''));
+    .find(e => /^(能力|强度|Capability|Intensity|Effort)$/i.test(e.getAttribute('aria-label') || ''));
   const ids = c ? (c.getAttribute('aria-describedby') || '').split(/\\s+/) : [];
   const txt = ids.map(i => (document.getElementById(i) || {{}}).innerText || '').join(' ');
   const m = txt.match(/^\\s*([^，,]+)[，,]\\s*第\\s*(\\d+)\\s*项/)
@@ -368,7 +425,7 @@ _CHIPS_JS = """
     // 输入框可能还没渲染出来（续聊时接上已有对话页尤其常见）。
     // 不判空的话这里直接抛 TypeError: ... reading 'closest'，
     // 而调用方看到的是一个跟 DOM 完全不沾边的报错，很难往「页面没加载完」上想。
-    const _composer = document.querySelector('#prompt-textarea');
+    const _composer = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
     const _form = (_composer && _composer.closest('form')) || document.body;
     const _hit = e => /在文本字段中显示|Show in text field/.test(e.textContent);
     const chips = () => [..._form.querySelectorAll('*')]
@@ -383,7 +440,7 @@ _CHIPS_JS = """
 # 另外整段正文只落在一个 <p> 里，换行是 <br>，所以不能按段落切。
 _TEXT_JS = r"""
     const _logical = () => {
-        const el = document.querySelector('#prompt-textarea');
+        const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
         if (!el) return '';
         const out = [];
         const walk = n => {
@@ -402,16 +459,26 @@ _TEXT_JS = r"""
 """
 
 _PASTE_JS = """
-    const el = document.querySelector('#prompt-textarea');
+    const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
     if (!el) return {ok: false, why: 'no_composer'};
-""" + _TEXT_JS + _CHIPS_JS + """
-    const before = document.querySelectorAll('[data-message-author-role]').length;
+""" + _TEXT_JS + _CHIPS_JS + _MESSAGES_JS + """
+    const before = _messageCount();
     const chips_before = chips();
     el.focus();
     if (ARG.clear) { document.execCommand('selectAll'); document.execCommand('delete'); }
     const dt = new DataTransfer();
     dt.setData('text/plain', ARG.text);
     el.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true}));
+    // 2026-09-28 新版 composer（ProseMirror、无 #prompt-textarea）不吃合成 paste 事件：
+    // 粘贴后仍是空的、也没转成附件，就改用原生 insertText，逐行插入、换行走 insertParagraph。
+    await new Promise(r => setTimeout(r, 400));
+    if (_logical().trim().length === 0 && chips() === chips_before) {
+        el.focus();
+        ARG.text.split('\\n').forEach((ln, i) => {
+            if (i) document.execCommand('insertParagraph');
+            if (ln) document.execCommand('insertText', false, ln);
+        });
+    }
 
     // 不是 sleep 后拍一张照：超长正文转附件要走「清空 composer → 建附件 → chip 出现 →
     // 可发送」好几步，固定等待会采样到中间态。这里轮询到形态稳定为止。
@@ -427,19 +494,19 @@ _PASTE_JS = """
         } else { stable = 0; }
         last = now;
     }
-    const sendBtn = document.querySelector('[data-testid="send-button"]');
+    const sendBtn = """ + _SEND_BTN + """;
     return {ok: true, len: _logical().trim().length,
             inner_len: el.innerText.trim().length,
             chips_before: chips_before, chips_after: chips(),
             send_enabled: sendBtn ? !sendBtn.disabled : null,
-            msgs_delta: document.querySelectorAll('[data-message-author-role]').length - before};
+            msgs_delta: _messageCount() - before};
 """
 
 # 清残留附件：selectAll+delete 只清 composer，**清不掉附件**（2026-08-21 实测）。
 # 附件卡片上没有移除键，唯一的出路是点「在文本字段中显示」把它还原成内联文本再删。
 _DROP_CHIPS_JS = """
 """ + _TEXT_JS + _CHIPS_JS + """
-    const el = document.querySelector('#prompt-textarea');
+    const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
     if (!el) return {chips: chips(), composer: -1, why: 'no_composer'};
     for (let i = 0; i < 6 && chips() > 0; i++) {
         const btn = [..._form.querySelectorAll('button,[role=button]')].find(
@@ -463,21 +530,27 @@ _DROP_CHIPS_JS = """
 # 锚点用每张卡片上的移除按钮：aria-label 形如「移除文件1：a.png」
 # （英文界面是 Remove file 1: ...）。这是定位优先级①的 a11y name；
 # 卡片本身只有 tailwind 生成的 class，改版必变，不能用。
+# 2026-10-10 实测新版改成「移除 a.docx」（空格 + 文件名、无引号），按带扩展名的文件名认。
 _UPLOADS_JS = """
     const _upBtns = () => [...document.querySelectorAll('button,[role=button]')]
-        .filter(b => /^(移除文件|Remove file)/.test(b.getAttribute('aria-label') || ''));
+        .filter(b => /^(移除文件|Remove file|移除[“"]|Remove [“"])/.test(b.getAttribute('aria-label') || '')
+                  || /^(移除|Remove) .+\\.[A-Za-z0-9]{1,8}$/.test(b.getAttribute('aria-label') || ''));
     const _upNames = () => _upBtns().map(
-        b => (b.getAttribute('aria-label') || '').replace(/^(移除文件|Remove file)\s*\d*\s*[:：]\s*/, ''));
+        b => (b.getAttribute('aria-label') || '').replace(/^(移除文件|Remove file)\s*\d*\s*[:：]\s*/, '').replace(/^(移除|Remove)\s*[“"]/, '').replace(/[”"]$/, '').replace(/^(移除|Remove) /, ''));
     // 注意：卡片里那个转圈**不能**当就绪判据。实测它在上传完成之后才出现
     // （卡片先转圈消失 →3s→ 又回来），而且长期不消失；带着它按发送照样能发出去
     // （实测 1s 拿到 URL）。它是上传完成后的二次处理指示，不是「还没传完」。
 """
 
-# 文件输入框：ChatGPT 有三个 input[type=file]，#upload-photos / #upload-camera
-# 限 image/*，只有通吃的那个 accept 为空。挑 accept 最宽的那个——这样支持什么
-# 由 ChatGPT 服务端决定，我们不自己维护一张类型白名单。
-_FILE_INPUT = ("[...document.querySelectorAll('input[type=file]')]"
-               ".sort((a, b) => (a.accept ? 1 : 0) - (b.accept ? 1 : 0))[0]")
+# 续聊页会保留另一份隐藏 form；全页第一个通用文件框可能属于它，上传后没有卡片。
+# 只取实际 composer 所属 form，再挑 accept 最宽的文件框，不维护类型白名单。
+_FILE_INPUT = """(() => {
+    const composer = document.querySelector('#prompt-textarea') ||
+        document.querySelector('div.ProseMirror[contenteditable=true]');
+    const form = composer && composer.closest('form');
+    return form ? [...form.querySelectorAll('input[type=file]')]
+        .sort((a, b) => (a.accept ? 1 : 0) - (b.accept ? 1 : 0))[0] : null;
+})()"""
 
 MAX_ATTACHMENTS = 10          # ChatGPT 单条消息的上限，先拦住免得白等一场
 
@@ -558,6 +631,88 @@ def count_chips(page):
 def drop_chips(page):
     """清掉输入框里遗留的附件。返回清完之后还剩几个。"""
     return page.call_fn(_DROP_CHIPS_JS.replace("ARG", "null"), None, timeout=60)
+
+
+def inspect_draft_state(page):
+    """只读未发送现场；正文只返回摘要，不把它再存一份到作业元数据。"""
+    guard_host(page)
+    state = page.evaluate("(() => {" + _TEXT_JS + _CHIPS_JS + _UPLOADS_JS + _MESSAGES_JS + """
+        const r = _composer && _composer.getBoundingClientRect();
+        return {root_path: location.pathname === '/',
+                has_composer: !!r && r.width > 0 && r.height > 0,
+                messages: _messageCount(),
+                generating: !!(""" + _STOP_BTN + """),
+                text: _logical().trim(), chips: chips(), uploads: _upNames()};
+    })()""")
+    text = state.pop("text")
+    state["text_len"] = len(text)
+    state["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return state
+
+
+def blank_draft(state):
+    return (state["root_path"] and state["has_composer"] and not state["messages"]
+            and not state["generating"] and not state["text_len"]
+            and not state["chips"] and not state["uploads"])
+
+
+def reuse_pending_chat(pending, timeout=PAGE_TIMEOUT):
+    """仅恢复本作业的未发首页。存在但不可核验的页必须停下，不能换一页掩盖失败。"""
+    target_id = pending["target_id"]
+    if not cdp.target_exists(target_id):
+        return None, None
+    page = None
+    try:
+        page = cdp.attach(target_id)
+        guard_host(page)
+        _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))",
+              "输入框就绪", timeout)
+        state = inspect_draft_state(page)
+        safe = state["root_path"] and state["has_composer"] and not state["messages"] and not state["generating"]
+        if not safe or not (blank_draft(state) or state == pending.get("snapshot")):
+            raise CdpError(f"待确认页面 {target_id} 已改变或无法核验，保留现场；未清理、未另开页面")
+        return page, target_id
+    except Exception:
+        if page:
+            page.close()
+        raise
+
+
+def clear_verified_draft(page):
+    """调用方已经核验归属；清空旧内容后按当前源文件重新准备，绝不发送缓存附件。"""
+    guard_host(page)
+    if drop_uploads(page):
+        raise CdpError("已核验草稿的上传件未清空，已停止")
+    guard_host(page)
+    if drop_chips(page).get("chips"):
+        raise CdpError("已核验草稿的文本附件未清空，已停止")
+    guard_host(page)
+    _paste(page, "", clear=True)
+    if not blank_draft(inspect_draft_state(page)):
+        raise CdpError("已核验草稿未完全清空，已停止")
+
+
+def cleanup_empty_chat(target_id, page=None):
+    """仅供自检回收自己新建的页；不确定或非空就保留，并回查关闭结果。"""
+    attached = None
+    try:
+        if not cdp.target_exists(target_id):
+            return {"closed": True, "reason": "页面已不存在"}
+        if page is None:
+            page = attached = cdp.attach(target_id)
+        if not blank_draft(inspect_draft_state(page)) or not check_login(page):
+            return {"closed": False, "reason": "页面非空或不是可识别的已登录首页"}
+        cdp.close_target(target_id)
+        deadline = time.monotonic() + 2
+        while cdp.target_exists(target_id) and time.monotonic() < deadline:
+            time.sleep(0.1)       # Target.closeTarget 的回复早于 /json/list 移除
+        closed = not cdp.target_exists(target_id)
+        return {"closed": closed, "reason": None if closed else "关闭后页面仍存在"}
+    except (CdpError, OSError) as e:
+        return {"closed": False, "reason": str(e)}
+    finally:
+        if attached:
+            attached.close()
 
 
 def _paste(page, text, clear, budget=20000, timeout=90):
@@ -648,14 +803,14 @@ def send(page, confirm=12):
     所以下面每一个「已发出去」的证据里都包含 stop 按钮的出现，
     只有全部证据都不成立、且 send 按钮还在，才允许换一种方式再点一次。
     """
-    _SENT_JS = """(() => {
-        const el = document.querySelector('#prompt-textarea');
+    _SENT_JS = "(() => {" + _MESSAGES_JS + """
+        const el = (document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'));
         return JSON.stringify({
             len: el ? el.innerText.trim().length : -1,
-            users: document.querySelectorAll('[data-message-author-role=user]').length,
+            users: _messages('user').length,
             url: location.pathname,
-            stop: !!document.querySelector('[data-testid="stop-button"]'),
-            send: !!document.querySelector('[data-testid="send-button"]')});
+            stop: !!(""" + _STOP_BTN + """),
+            send: !!(""" + _SEND_BTN + """)});
     })()"""
 
     # 判据一律跟点击前的基线比，不能用绝对值：续聊时 URL 本来就是 /c/...、
@@ -671,7 +826,7 @@ def send(page, confirm=12):
                 or st["users"] > base["users"]
                 or (st["stop"] and not base["stop"])
                 or (base["send"] and not st["send"]))
-    page.click_js("document.querySelector('[data-testid=\"send-button\"]')", "发送按钮")
+    page.click_js(_SEND_BTN, "发送按钮")
     if before <= 0:
         return                      # 输入框本来就空，验不了，也就不敢重试
 
@@ -706,7 +861,7 @@ def send(page, confirm=12):
     # 用 cdp 里那套完整指针序列，**不要用裸 el.click()**：ChatGPT 的按钮是
     # React 组件，行为绑在 pointerdown/mousedown 上，只发一个 click 事件不触发。
     # 这里用选择器当场重新定位，绝不用之前那次的坐标（那个位置现在可能是 stop）。
-    page.evaluate("(() => { const b = document.querySelector('[data-testid=\"send-button\"]');"
+    page.evaluate("(() => { const b = " + _SEND_BTN + ";"
                   f" return b ? {cdp.Page._JS_CLICK}(b) : false; }})()", timeout=20)
     ok, st = _wait(confirm)
     if ok:
@@ -717,9 +872,24 @@ def send(page, confirm=12):
 
 
 CONV_URL_JS = """(() => {
-  const m = location.pathname.match(/^\\/c\\/(.+)$/);
-  return m && !m[1].startsWith('WEB:') ? location.href : null;
+  const m = location.pathname.match(/^\\/c\\/([^/]+)$/);
+  if (!m) return null;
+  let id;
+  try { id = decodeURIComponent(m[1]); } catch (_) { return null; }
+  return id && !/[:/]/.test(id) ? location.href : null;
 })()"""
+
+
+def is_temporary_conversation_url(url):
+    path = urlsplit(url or "").path
+    return path.startswith("/c/") and ":" in unquote(path[3:])
+
+
+def is_conversation_url(url):
+    parsed = urlsplit(url or "")
+    ident = unquote(parsed.path[3:]) if parsed.path.startswith("/c/") else ""
+    return (parsed.scheme == "https" and parsed.netloc in CHATGPT_HOSTS
+            and bool(ident) and ":" not in ident and "/" not in ident)
 
 
 def wait_conversation_url(page, timeout=60):
@@ -735,33 +905,35 @@ def wait_conversation_url(page, timeout=60):
 
 # ---------------------------------------------------------------- 读结果
 
-_PROGRESS_JS = """(() => {
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+_PROGRESS_JS = "(() => {" + _MESSAGES_JS + """
+  const a = _messages('assistant');
+  const u = _messages('user');
   const last = a[a.length - 1];
-  const t = last ? last.innerText : '';
+  const t = _messageText(last);
   return {
     url: location.href,
-    generating: !!document.querySelector('[data-testid="stop-button"]'),
+    generating: !!(""" + _STOP_BTN + """),
     assistant_msgs: a.length,
-    user_msgs: document.querySelectorAll('[data-message-author-role="user"]').length,
+    user_msgs: u.length,
+    has_messages: a.length + u.length > 0,
     // 结构探针：这两个锚点是「页面还是我们认识的样子」的证据。
     // 没有它们时，stop-button 缺失只能说明「选择器可能变了」，不能推出「生成完了」。
-    has_composer: !!document.querySelector('#prompt-textarea'),
-    has_send_btn: !!document.querySelector('[data-testid="send-button"]'),
+    has_composer: !!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]')),
+    has_send_btn: !!(""" + _SEND_BTN + """),
     len: t.length,
     tail: t.slice(-1200),
   };
 })()"""
 
-_FULL_JS = """(() => {
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+_FULL_JS = "(() => {" + _MESSAGES_JS + """
+  const a = _messages('assistant');
   const last = a[a.length - 1];
-  return last ? last.innerText : '';
+  return _messageText(last);
 })()"""
 
 
 def count_assistant(page):
-    return page.evaluate("document.querySelectorAll('[data-message-author-role=\"assistant\"]').length")
+    return page.evaluate("(() => {" + _MESSAGES_JS + " return _messages('assistant').length; })()")
 
 
 def wait_new_turn(page, before, timeout=90):
@@ -773,10 +945,8 @@ def wait_new_turn(page, before, timeout=90):
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        st = page.evaluate(
-            "(() => ({n: document.querySelectorAll('[data-message-author-role=\"assistant\"]').length,"
-            " gen: !!document.querySelector('[data-testid=\"stop-button\"]')}))()")
-        if st["n"] > before or st["gen"]:
+        st = read_progress(page)
+        if st["assistant_msgs"] > before or st["generating"]:
             return st
         time.sleep(0.5)
     raise CdpError(f"发送后 {timeout}s 内没看到新回合（助手消息数仍为 {before}，也没有生成中标志）")
@@ -790,28 +960,41 @@ def read_full(page):
     return page.evaluate(_FULL_JS, timeout=120)
 
 
-def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT):
+def save_failed_page(page, directory):
+    snapshot = page.call('Accessibility.getFullAXTree', {})
+    (directory / 'failed-snapshot.txt').write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
+    shot = page.call('Page.captureScreenshot', {'format': 'webp'})
+    (directory / 'failed-page.webp').write_bytes(base64.b64decode(shot['data']))
+
+
+def attach_or_open(page_id, conversation_url, timeout=PAGE_TIMEOUT, on_reopen=None):
     """优先复用 submit 时那个标签页；被关掉了就用 conversation_url 重开一个。"""
-    if page_id:
+    if page_id and cdp.target_exists(page_id):
+        page = None
         try:
             page = cdp.attach(page_id)
             guard_host(page)
             # 复用的标签页也要确认输入框在——它可能刚被导航走又回来，
             # 或者页面还在重建。不等就会在后面注入时撞上空的 composer。
-            _wait(page, "!!document.querySelector('#prompt-textarea')", "输入框就绪", timeout)
+            _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout)
             return page, page_id, False
-        except CdpError:
-            pass
+        except Exception:
+            if page:
+                page.close()
+            raise                # target 还在：连接/UI 失败不能靠另开页面掩盖
     if not conversation_url:
         raise CdpError("既没有可用标签页，job.json 里也没有 conversation_url")
-    page, target_id = cdp.open_page(conversation_url, timeout=timeout)
+    if not is_conversation_url(conversation_url):
+        raise CdpError("没有可用标签页，且会话 URL 不是正式地址；保留作业，未另开页面")
+    page, target_id = cdp.open_page(conversation_url, timeout=timeout, on_created=on_reopen)
     try:
         guard_host(page)
         # 会话内容是异步渲染的。刚打开就读会拿到 0 条消息 + 无停止按钮，
         # 看起来跟「已完成但没输出」一模一样，会误判。
-        _wait(page, "document.querySelectorAll('[data-message-author-role]').length > 0",
+        _wait(page, "(() => {" + _MESSAGES_JS + " return _messageCount() > 0; })()",
               "会话消息渲染", timeout=timeout)
-        _wait(page, "!!document.querySelector('#prompt-textarea')", "输入框就绪", timeout=timeout)
+        _wait(page, "!!(document.querySelector('#prompt-textarea')||document.querySelector('div.ProseMirror[contenteditable=true]'))", "输入框就绪", timeout=timeout)
     except Exception:
         page.close()          # 只断 WS，标签页留着给人看现场
         raise

@@ -348,16 +348,18 @@ class Page(Session):
         overflow:clip 裁掉，此时元素照样有非零 rect，但那个坐标上最上层是菜单
         底下的页面。照着点既点不到目标，还会把菜单点关。所以必须做命中测试。
         """
-        # 只在元素确实在视口外时才 scrollIntoView。无条件滚会把下拉菜单
+        # 只在目标中心越界或被遮挡时才 scrollIntoView。无条件滚会把下拉菜单
         # （overflow:auto 的小容器）滚得每次探测都换位置，坐标永远稳定不下来。
         return self.evaluate(
             "(() => { const el = (" + finder_js + "); if (!el) return null;"
             " let r = el.getBoundingClientRect();"
-            " if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) {"
+            " if (r.top + r.height/2 < 0 || r.top + r.height/2 >= innerHeight"
+            " || r.left + r.width/2 < 0 || r.left + r.width/2 >= innerWidth"
+            " || !el.contains(document.elementFromPoint(r.left + r.width/2, r.top + r.height/2))) {"
             "   el.scrollIntoView({block:'center'}); r = el.getBoundingClientRect(); }"
             " if (!r.width || !r.height) return null;"
             " const x = r.left + r.width/2, y = r.top + r.height/2;"
-            " if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return null;"
+            " if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;"
             " const top = document.elementFromPoint(x, y);"
             " if (!top || !(top === el || el.contains(top))) return null;"
             " return {x, y}; })()"
@@ -435,7 +437,7 @@ def _page_ws(target_id):
     raise CdpError(f"新标签页 {target_id} 未出现在 /json/list")
 
 
-def open_page(url, timeout=60, background=True):
+def open_page(url, timeout=60, background=True, on_created=None):
     """新开标签页并返回 (Page, target_id)。走浏览器级 Target.createTarget，比 PUT /json/new 稳。
 
     默认后台创建：不抢焦点、不闪标签页。
@@ -459,6 +461,8 @@ def open_page(url, timeout=60, background=True):
             target_id = browser.call("Target.createTarget", params)["targetId"]
     finally:
         browser.close()
+    if on_created:
+        on_created(target_id)     # 先交还归属，再连接和等待；失败也能找到这一页
     page = Page(_page_ws(target_id))
     page.call("Page.enable")
     page.call("Runtime.enable")
@@ -482,6 +486,10 @@ def attach(target_id):
     page = Page(_page_ws(target_id))
     page.unfreeze()
     return page
+
+
+def target_exists(target_id):
+    return any(p.get("id") == target_id for p in list_pages())
 
 
 def close_target(target_id):
