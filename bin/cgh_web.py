@@ -124,8 +124,9 @@ _MESSAGES_JS = r"""
     const _messages = role => {
         const name = role === 'assistant' ? /^(ChatGPT 说：|ChatGPT said:)$/
                                          : /^(你说：|You said:)$/;
+        // 标题含隐藏的打印用名字；innerText 排除它，避免读成“ChatGPT 说：ChatGPT”。
         const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')]
-            .filter(h => name.test((h.getAttribute('aria-label') || h.textContent).trim()));
+            .filter(h => name.test((h.getAttribute('aria-label') || h.innerText).trim()));
         const modern = headings.filter(h => role === 'assistant'
             ? h.getAttribute('data-conversation-role') === 'assistant'
             : h.nextElementSibling?.querySelector('[data-user-message-bubble]'));

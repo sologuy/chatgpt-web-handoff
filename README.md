@@ -29,6 +29,11 @@ No credentials touched, stored, or moved — it drives the session you're alread
 
 ---
 
+## v0.7.1 · 2026-11-01
+
+- **Speaker heading compatibility:** shared message detection ignores hidden print-only names, fixing `ui_changed` when completed replies were read as zero messages.
+- **Recovery source boundary:** manual parsing must use the matching assistant reply and job markers; whole-page text is not a reply source.
+
 ## v0.7.0 · 2026-10-23
 
 - **Two optional skills:** install `chatgpt-handoff`, `chatgpt-image-gen`, or both from one checkout. Image generation does not require the handoff skill to be installed.

@@ -127,6 +127,11 @@ $CGH wait --id <job_id> --timeout 1800
   `findings` / `recommended_actions` 复述给用户，附上 `result.md` 路径与对话 URL。
 - 返回 `timed_out: true`：**不是失败**，作业还活着。再跑一次 `wait` 接着等。
 - 返回 `no_sentinel`：ChatGPT 没按格式收尾，原文已存，交用户判断。
+- 返回 `ui_changed`：保留原页和错误。定位问题修复并验证后，确认最新助手回复仍对应本作业，才用 `$CGH wait --id <job_id> --resume` 恢复收取，不重新提交。
+
+手工 `parse --from` 的来源必须是**对应助手消息容器中的原文**：先确认生成结束，
+并核对本作业完整的 `CGH_RESULT_<job_id>` / `CGH_END_<job_id>`。禁止把整页
+`document.body.innerText`、用户提示模板或前轮对话当作本轮助手原文；不能自行补写字段。
 
 Pro 档实测约 10 分钟，前几分钟 `chars=0` 是正常的思考阶段，不是卡住了。
 `wait` 会自己等到底，**这不构成用 Pro 的成本**——你不需要盯着，用户也不需要。
