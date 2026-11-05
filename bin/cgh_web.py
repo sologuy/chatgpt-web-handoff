@@ -60,6 +60,10 @@ class WrongPage(CdpError):
     pass
 
 
+class ConversationBusy(CdpError):
+    pass
+
+
 class EffortNotFound(CdpError):
     def __init__(self, wanted, available):
         super().__init__(f"档位 {wanted} 不在可选项里：{available}")
@@ -145,6 +149,14 @@ _MESSAGES_JS = r"""
         return el.innerText;
     };
     const _messageCount = () => _messages('assistant').length + _messages('user').length;
+    const _lastReply = () => {
+        const a = _messages('assistant'), u = _messages('user');
+        const last = a[a.length - 1], user = u[u.length - 1];
+        if (!last || !user) return last;
+        const order = user.compareDocumentPosition(last);
+        return (order & Node.DOCUMENT_POSITION_FOLLOWING)
+            && !(order & Node.DOCUMENT_POSITION_DISCONNECTED) && !user.contains(last) ? last : null;
+    };
 """
 
 
@@ -479,14 +491,30 @@ _TEXT_JS = r"""
     };
 """
 
+_CLEAR_COMPOSER_JS = """
+    const _clearComposer = async el => {
+        if (!_logical().trim()) return true;
+        el.focus();
+        if (document.activeElement !== el) return false;
+        const selection = window.getSelection(), range = document.createRange();
+        range.selectNodeContents(el);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand('delete');
+        await new Promise(r => setTimeout(r, 150));
+        return el.isConnected && document.activeElement === el && !_logical().trim();
+    };
+"""
+
 _PASTE_JS = """
     const el = """ + _COMPOSER + """;
     if (!el) return {ok: false, why: 'no_composer'};
-""" + _TEXT_JS + _CHIPS_JS + _MESSAGES_JS + """
+""" + _TEXT_JS + _CHIPS_JS + _MESSAGES_JS + _CLEAR_COMPOSER_JS + """
     const before = _messageCount();
     const chips_before = chips();
     el.focus();
-    if (ARG.clear) { document.execCommand('selectAll'); document.execCommand('delete'); }
+    if (ARG.clear && !await _clearComposer(el))
+        return {ok: false, why: 'composer_clear_failed'};
     const dt = new DataTransfer();
     dt.setData('text/plain', ARG.text);
     el.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true}));
@@ -526,7 +554,7 @@ _PASTE_JS = """
 # 清残留附件：selectAll+delete 只清 composer，**清不掉附件**（2026-08-21 实测）。
 # 附件卡片上没有移除键，唯一的出路是点「在文本字段中显示」把它还原成内联文本再删。
 _DROP_CHIPS_JS = """
-""" + _TEXT_JS + _CHIPS_JS + """
+""" + _TEXT_JS + _CHIPS_JS + _CLEAR_COMPOSER_JS + """
     const el = """ + _COMPOSER + """;
     if (!el) return {chips: chips(), composer: -1, why: 'no_composer'};
     for (let i = 0; i < 6 && chips() > 0; i++) {
@@ -535,10 +563,11 @@ _DROP_CHIPS_JS = """
         if (!btn) break;
         btn.click();
         await new Promise(r => setTimeout(r, 1500));
-        el.focus(); document.execCommand('selectAll'); document.execCommand('delete');
-        await new Promise(r => setTimeout(r, 500));
+        if (!await _clearComposer(el))
+            return {chips: chips(), composer: _logical().trim().length, why: 'composer_clear_failed'};
     }
-    el.focus(); document.execCommand('selectAll'); document.execCommand('delete');
+    if (!await _clearComposer(el))
+        return {chips: chips(), composer: _logical().trim().length, why: 'composer_clear_failed'};
     return {chips: chips(), composer: _logical().trim().length};
 """
 
@@ -591,6 +620,7 @@ def drop_uploads(page, timeout=30):
     和遗留附件卡片同样的道理：留着不清就会把上一个作业的文件一起发出去，
     而且还返回成功。这里只点每张卡片自己的移除键，不碰别的控件。
     """
+    guard_host(page)
     return page.evaluate("(async () => {" + _UPLOADS_JS + """
         for (let i = 0; i < 12 && _upBtns().length; i++) {
             _upBtns()[0].click();
@@ -652,7 +682,11 @@ def count_chips(page):
 
 def drop_chips(page):
     """清掉输入框里遗留的附件。返回清完之后还剩几个。"""
-    return page.call_fn(_DROP_CHIPS_JS.replace("ARG", "null"), None, timeout=60)
+    guard_host(page)
+    state = page.call_fn(_DROP_CHIPS_JS.replace("ARG", "null"), None, timeout=60)
+    if state.get("why") == "composer_clear_failed":
+        raise CdpError("输入框清空失败，保留残留内容；未粘贴、未发送")
+    return state
 
 
 def inspect_draft_state(page):
@@ -738,9 +772,12 @@ def cleanup_empty_chat(target_id, page=None):
 
 
 def _paste(page, text, clear, budget=20000, timeout=90):
+    guard_host(page)
     got = page.call_fn(_PASTE_JS, {"text": text, "clear": clear, "budget": budget},
                        timeout=timeout)
     if not got.get("ok"):
+        if got.get("why") == "composer_clear_failed":
+            raise CdpError("输入框清空失败，保留残留内容；未粘贴、未发送")
         raise CdpError(f"正文注入失败：{got.get('why')}")
     if got.get("msgs_delta"):
         raise CdpError(
@@ -767,6 +804,7 @@ def inject(page, text, tail=None):
     会被当成本次的，下一个作业带着别人的上下文发出去还返回成功。
     这种静默发错上下文比直接报错严重得多。
     """
+    require_idle(page)
     text = text.strip()
     left = drop_chips(page)
     if left.get("chips"):
@@ -806,7 +844,7 @@ def inject(page, text, tail=None):
 
 
 class SendNotTaken(CdpError):
-    """点了发送但页面没有任何反应——**确证没发出去**，重跑是安全的。"""
+    """尚未点击，或点击后确证未发送；页面就绪后可重试。"""
 
 
 def send(page, confirm=12):
@@ -832,13 +870,16 @@ def send(page, confirm=12):
             users: _messages('user').length,
             url: location.pathname,
             stop: !!(""" + _STOP_BTN + """),
-            send: !!(""" + _SEND_BTN + """)});
+            send: !!(""" + _SEND_BTN + """),
+            enabled: !!(""" + _SEND_BTN + """) && !(""" + _SEND_BTN + """).disabled});
     })()"""
 
     # 判据一律跟点击前的基线比，不能用绝对值：续聊时 URL 本来就是 /c/...、
     # 本来就有用户消息，用绝对判据的话点击之前就"已发送"，校验形同虚设。
     base = json.loads(page.evaluate(_SENT_JS, timeout=20))
     before = base["len"]
+    if base["stop"] or not base["enabled"] or before < 0:
+        raise SendNotTaken("发送前仍在生成或找不到发送控件；未点击发送")
 
     def _sent(st):
         # 任意一条成立就说明这一发已经出去了，绝不能再点。
@@ -848,7 +889,13 @@ def send(page, confirm=12):
                 or st["users"] > base["users"]
                 or (st["stop"] and not base["stop"])
                 or (base["send"] and not st["send"]))
-    page.click_js(_SEND_BTN, "发送按钮")
+    try:
+        page.click_js(_SEND_BTN, "发送按钮")
+    except CdpError as e:
+        # click_js 先 wait_hittable；这个错误发生时尚未派发任何点击。
+        if str(e) == "定位失败：发送按钮":
+            raise SendNotTaken("发送按钮未就绪；未点击发送") from e
+        raise
     if before <= 0:
         return                      # 输入框本来就空，验不了，也就不敢重试
 
@@ -927,16 +974,28 @@ def wait_conversation_url(page, timeout=60):
 
 # ---------------------------------------------------------------- 读结果
 
-_PROGRESS_JS = "(() => {" + _MESSAGES_JS + """
+_PROGRESS_JS = "(() => {" + _MESSAGES_JS + r"""
   const a = _messages('assistant');
   const u = _messages('user');
   const last = a[a.length - 1];
-  const t = _messageText(last);
+  const lastUser = u[u.length - 1];
+  const t = _messageText(_lastReply());
+  const jobIds = text => [...text.matchAll(/CGH_RESULT_(hf_\d{8}_[a-z0-9]{6})\b[\s\S]*?CGH_END_\1\b/g)]
+      .map(m => m[1]);
+  const order = lastUser && last ? lastUser.compareDocumentPosition(last) : 0;
+  // 附件卡片在正文前，首行编号只从用户正文气泡读取。
+  const userText = _messageText(lastUser?.querySelector('[data-user-message-bubble]') || lastUser);
+  // 长内联会折叠末尾；超长附件的内联说明也以同一 Handoff 标题开头。
+  const heading = userText.match(/^\s*#?\s*Handoff\s+(hf_\d{8}_[a-z0-9]{6})\b/);
   return {
     url: location.href,
     generating: !!(""" + _STOP_BTN + """),
     assistant_msgs: a.length,
     user_msgs: u.length,
+    user_job_ids: heading ? [heading[1]] : jobIds(userText),
+    assistant_job_ids: jobIds(t),
+    assistant_after_user: !!(order & Node.DOCUMENT_POSITION_FOLLOWING)
+        && !(order & Node.DOCUMENT_POSITION_DISCONNECTED) && !lastUser.contains(last),
     has_messages: a.length + u.length > 0,
     // 结构探针：这两个锚点是「页面还是我们认识的样子」的证据。
     // 没有它们时，stop-button 缺失只能说明「选择器可能变了」，不能推出「生成完了」。
@@ -948,9 +1007,7 @@ _PROGRESS_JS = "(() => {" + _MESSAGES_JS + """
 })()"""
 
 _FULL_JS = "(() => {" + _MESSAGES_JS + """
-  const a = _messages('assistant');
-  const last = a[a.length - 1];
-  return _messageText(last);
+  return _messageText(_lastReply());
 })()"""
 
 
@@ -958,24 +1015,36 @@ def count_assistant(page):
     return page.evaluate("(() => {" + _MESSAGES_JS + " return _messages('assistant').length; })()")
 
 
-def wait_new_turn(page, before, timeout=90):
+def wait_new_turn(page, job_id, timeout=90):
     """续聊场景下确认「这一发真的出去了」。
 
     新开会话可以靠 URL 从 / 变成 /c/<id> 来确认；续聊时 URL 压根不变，
     wait_conversation_url 会立刻返回，等于没检查。这里改看真实证据：
-    助手消息数增加，或者生成中的停止按钮出现。
+    已发送的最新用户消息含本作业标记，不能拿前轮的停止按钮当证据。
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         st = read_progress(page)
-        if st["assistant_msgs"] > before or st["generating"]:
+        if job_id in st["user_job_ids"]:
             return st
         time.sleep(0.5)
-    raise CdpError(f"发送后 {timeout}s 内没看到新回合（助手消息数仍为 {before}，也没有生成中标志）")
+    raise CdpError(f"发送后 {timeout}s 内没看到本作业 {job_id} 的用户消息")
 
 
 def read_progress(page):
     return page.evaluate(_PROGRESS_JS)
+
+
+def require_idle(page):
+    guard_host(page)
+    if read_progress(page)["generating"]:
+        raise ConversationBusy("对话仍在生成，未清空或注入续聊正文；等待前轮完成后再提交")
+
+
+def read_response(page):
+    """在同一次求值中读回合证据和原文，避免两次读取之间切到另一轮。"""
+    return page.evaluate("(() => { const progress = " + _PROGRESS_JS
+                         + "; return {...progress, text: " + _FULL_JS + "}; })()", timeout=120)
 
 
 def read_full(page):

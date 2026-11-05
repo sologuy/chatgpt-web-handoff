@@ -100,6 +100,7 @@ $CGH new --action review --attach ./bug.png --attach ./trace.log -- <要审什�
 编辑 `<dir>/request.md`（`$CGH new` 已渲染好骨架，job_id 与审查对象已填入）。
 
 - 「目标」节里的审查对象**不要动**，`cgh submit` 会校验它还在不在。
+- 保留首行 `# Handoff <job_id>` 和本作业起止标记；长消息折叠后，首行编号用于确认已发送的回合。
 - 正文里要提一句附件是什么、想让对方看什么——光传上去不说，对方未必会去读。
 - 「已确认事实」只写有代码 / 日志 / 测试 / 文档支持的内容；「当前分析」明确标为假设。
 - git diff 只带相关文件，排除生成物与 lock 文件。
@@ -128,6 +129,7 @@ $CGH wait --id <job_id> --timeout 1800
 - 返回 `timed_out: true`：**不是失败**，作业还活着。再跑一次 `wait` 接着等。
 - 返回 `no_sentinel`：ChatGPT 没按格式收尾，原文已存，交用户判断。
 - 返回 `ui_changed`：保留原页和错误。定位问题修复并验证后，确认最新助手回复仍对应本作业，才用 `$CGH wait --id <job_id> --resume` 恢复收取，不重新提交。
+- 返回 `result_mismatch`：当前请求或回复无法归属于本作业，未保存成该作业的原文。核对页面和本轮用户消息，恢复正确现场后用 `wait --resume`；不能只凭同一个对话 URL 确认发送。
 
 手工 `parse --from` 的来源必须是**对应助手消息容器中的原文**：先确认生成结束，
 并核对本作业完整的 `CGH_RESULT_<job_id>` / `CGH_END_<job_id>`。禁止把整页
@@ -230,6 +232,10 @@ $CGH backfill                                # 补本仓库缺失事件（按 id
 | `ui_changed` + `background_unfreeze_failed` | 后台标签页解冻失效 | 不是改版。报告 Chrome 版本，别重试——页面已停止渲染，读到的都是旧值 |
 | `failed` + `attachment_state` | 输入框里有清不掉的遗留附件，或正文注入没落到 inline/附件任一形态 | **不是改版，也不要重试**。正文超过约 8000 字时 ChatGPT 会转成附件，`cgh` 会自己处理；报这个说明页面状态脏了。让用户看一眼那个标签页的输入框 |
 | `send_unknown` | 发送已经打出去了，但没确认到对话 URL | **绝不要直接重跑 submit**，那会产生重复 handoff。请用户去浏览器看那个标签页：<br>真发出去了 → `$CGH confirm --id <id> --url <对话URL>`（要真 id，不要 `/c/WEB:` 开头的临时 id）<br>确实没发出去 → `$CGH submit --id <id> --force-resend` |
+| `conversation_busy` | 前轮仍在生成，本轮未注入或发送 | 等待前轮结束后再提交；本地 abort 不会停止网页生成 |
+| `composer_clear_failed` | 输入框未能清空，已停止粘贴 | 保留现场，修复并核验后再重试；不要用反复强制提交累加正文 |
+| `turn_unverified` / `conversation_mismatch` | confirm 无法确认本轮用户消息或对话不一致 | 作业未修改；检查实际已发送的请求，不把 URL 存在当作发送凭据 |
+| `result_mismatch` | 回复属于其他作业，或无法确认回合归属 | 不自动重发；核对后 `wait --resume`。只有明确确认本轮未发送，才可对失败终态使用 `submit --force --force-resend` |
 | `effort_mismatch` | 你传的 `--effort` 与文本里的档位对不上 | **以用户说的为准**。别自己改档位，去掉 `--effort` 让 `cgh` 自己认最省事 |
 | `effort_drifted` | 发送前复验发现档位被别的 harness 改走了 | 本次**未发送、不消耗额度**。直接重跑 `submit` 即可 |
 | `browser_busy` | 另一个 cgh 正占着「设档位→发送」的临界区 | 同上，重跑即可。一直报就是有进程卡死了 |
