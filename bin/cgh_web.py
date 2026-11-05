@@ -877,8 +877,14 @@ def send(page, confirm=12):
     # 判据一律跟点击前的基线比，不能用绝对值：续聊时 URL 本来就是 /c/...、
     # 本来就有用户消息，用绝对判据的话点击之前就"已发送"，校验形同虚设。
     base = json.loads(page.evaluate(_SENT_JS, timeout=20))
+    # 附件卡片已出现后，发送按钮仍可能短暂禁用；首次点击前等它就绪，避免重传循环。
+    deadline = time.monotonic() + PAGE_TIMEOUT
+    while (base["send"] and not base["enabled"] and not base["stop"]
+           and base["len"] > 0 and time.monotonic() < deadline):
+        time.sleep(0.25)
+        base = json.loads(page.evaluate(_SENT_JS, timeout=20))
     before = base["len"]
-    if base["stop"] or not base["enabled"] or before < 0:
+    if base["stop"] or not base["enabled"] or before <= 0:
         raise SendNotTaken("发送前仍在生成或找不到发送控件；未点击发送")
 
     def _sent(st):
@@ -979,7 +985,8 @@ _PROGRESS_JS = "(() => {" + _MESSAGES_JS + r"""
   const u = _messages('user');
   const last = a[a.length - 1];
   const lastUser = u[u.length - 1];
-  const t = _messageText(_lastReply());
+  const reply = _lastReply();
+  const t = _messageText(reply);
   const jobIds = text => [...text.matchAll(/CGH_RESULT_(hf_\d{8}_[a-z0-9]{6})\b[\s\S]*?CGH_END_\1\b/g)]
       .map(m => m[1]);
   const order = lastUser && last ? lastUser.compareDocumentPosition(last) : 0;
@@ -990,6 +997,9 @@ _PROGRESS_JS = "(() => {" + _MESSAGES_JS + r"""
   return {
     url: location.href,
     generating: !!(""" + _STOP_BTN + """),
+    // 2026-11-05 实测：正文停顿时仍是 in_progress，完成后才变 complete。
+    // 复制代码按钮在生成中也存在，不能拿它当作回复已结束。
+    reply_state: reply?.closest('[data-talvt-turn-state]')?.getAttribute('data-talvt-turn-state') || null,
     assistant_msgs: a.length,
     user_msgs: u.length,
     user_job_ids: heading ? [heading[1]] : jobIds(userText),

@@ -61,16 +61,18 @@ ACTIONS = {"review", "design", "debug"}
 # 用户没点档位时用它。改这一行即可，不用动别处。
 DEFAULT_EFFORT = "xhigh"    # 极高。用户明确要求：默认就往高了走，别省
 
-# 从审查对象文本里认档位。刻意要求档位词紧挨着「模式/档」，或者是 pro/最高 这种
-# 本身就无歧义的说法——否则「高并发」「中间件」这类词会被误判成档位。
+# 从审查对象文本里认档位；Pro 需有明确使用语境，避免设备型号抢走中文档位指令。
 EFFORT_IN_WORDS = [
-    (r"(?:^|[^a-zA-Z])pro(?![a-zA-Z])", "pro"),
     (r"最高档?位?|顶配", "pro"),
     (r"即时\s*(?:模式|档位?)?", "instant"),
     (r"极速\s*(?:模式|档位?)?", "instant"),
     (r"极高\s*(?:模式|档位?)?|超高\s*(?:模式|档位?)", "xhigh"),
     (r"高级\s*(?:模式|档位?)|高\s*(?:模式|档位)", "high"),
     (r"中级\s*(?:模式|档位?)?|中等\s*(?:模式|档位?)|中\s*(?:模式|档位)", "medium"),
+    (r"(?:(?:用|走|选|切到?|换|上|开|按)\s*pro(?![a-zA-Z0-9_])"
+     r"|(?:chatgpt|gpt)(?:\s*web)?(?:\s*[-v]?\d+(?:\.\d+)?)?\s*pro(?![a-zA-Z0-9_])"
+     r"|(?<![a-zA-Z0-9_])pro\s*(?:模式|档位?|推理|思考)"
+     r"|^\s*pro\s*(?:$|审查|评审|分析))", "pro"),
 ]
 
 
@@ -658,6 +660,9 @@ def cmd_parse(a):
     if not src.exists():
         die("no_source", f"原文文件不存在：{src}")
     raw = src.read_text(encoding="utf-8")
+    if _full_page_input(raw):
+        die("full_page_input", "原文混入用户 Handoff 模板与助手回合，未写入作业",
+            hint=f"优先 cgh wait --id {a.id} --resume 从原网页收取；或仅复制对应助手消息再 parse")
 
     with Lock(d):
         job = load_job(d, a.id)
@@ -681,6 +686,31 @@ def cmd_parse(a):
        recommended_actions=len(parsed["recommended_actions"]))
 
 
+def _full_page_input(raw):
+    """只识别明确的整页结构，保留正文里的代码示例与引用。"""
+    lines, fence = [], None
+    for line in raw.splitlines():
+        mark = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})", line)
+        if mark:
+            token = mark[1]
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence):
+                fence = None
+            continue
+        if fence is None and not re.match(r"^[ \t]*>", line):
+            lines.append(line)
+    text = "\n".join(lines)
+    for request in re.finditer(
+            r"(?m)^(?:你说：|You said:)[ \t]*\n([\s\S]*?)"
+            r"^(?:ChatGPT 说：|ChatGPT said:)[ \t]*(?:\n|$)", text):
+        body = request[1]
+        if (re.search(r"(?m)^#\s*Handoff\s+hf_\d{8}_[0-9a-z]{6}\b", body)
+                and re.search(r"(?m)^verdict:\s*pass\s*\|\s*revise\s*\|\s*reject[ \t]*$", body)):
+            return True
+    return False
+
+
 def _foreign_result_ids(raw, job_id):
     blocks = list(re.finditer(r"CGH_RESULT_(hf_\d{8}_[a-z0-9]{6})\b[\s\S]*?CGH_END_\1\b", raw))
     ids = {m[1] for m in blocks}
@@ -699,7 +729,16 @@ def _store_parse(d, job, raw):
     if foreign:
         die("result_mismatch", "原文中的完整结果属于其他作业，未写入本作业",
             job_id=job["id"], found=foreign)
-    (jd / "raw-last-message.txt").write_text(raw, encoding="utf-8")
+    raw_file = jd / "raw-last-message.txt"
+    if raw_file.exists():
+        previous = raw_file.read_bytes()
+        if previous != raw.encode("utf-8"):
+            digest = hashlib.sha256(previous).hexdigest()
+            backup = jd / f"raw-last-message.prev-{digest[:12]}.txt"
+            if not backup.exists():
+                backup.write_bytes(previous)
+            job["notes"].append(f"{now()} 保留旧原文 {backup.name}，{len(previous)}字节，SHA256={digest}")
+    raw_file.write_text(raw, encoding="utf-8")
     parsed, err = parse_sentinel(raw, job["id"])
     if err:
         job["status"] = "no_sentinel"
@@ -1151,13 +1190,20 @@ def _poll_once(d, job_id, hold=None, resume=False):
     job = load_job(d, job_id)
     if job["status"] in TERMINAL:
         # 被传输层抖动误判成终态、但对话还在那儿的作业，允许接着等。
-        # 只放行「失败终态 + 有对话 URL」这一种；已经拿到结果的不放行。
-        if (resume and job["status"] in ERROR_TERMINAL and job.get("conversation_url")):
+        # 缺格式的结果也可能是早期版本收取了半截；显式恢复只重收，不重发。
+        recoverable = ERROR_TERMINAL | {"no_sentinel"}
+        if (resume and job["status"] in recoverable and job.get("conversation_url")):
             with Lock(d):
+                busy = active_job(d)
+                if busy and busy["id"] != job_id:
+                    die("busy", "已有活跃作业，暂不能恢复另一作业", active_id=busy["id"])
                 j = load_job(d, job_id)
                 j["notes"].append(f"{now()} 从终态 {j['status']} 恢复轮询（--resume）")
                 j["status"] = "generating"
                 j["error"] = None
+                j["completed_at"] = None
+                j["stalled_count"] = 0
+                j.pop("last_raw_sha256", None)
                 save_job(d, j)
             job = load_job(d, job_id)
         else:
@@ -1165,8 +1211,12 @@ def _poll_once(d, job_id, hold=None, resume=False):
             return True, dict(job_id=job["id"], status=job["status"], terminal=True,
                               result=str(jd / job["result_file"]) if job.get("result_file") else None,
                               hint=("这一发已经发出去了、对话还在，可以 --resume 接着等"
-                                    if job.get("conversation_url") and job["status"] in ERROR_TERMINAL
+                                    if job.get("conversation_url") and job["status"] in recoverable
                                     else None))
+
+    if not job.get("send_attempted_at") and not job.get("conversation_url"):
+        die("not_submitted", "作业尚未提交，不能轮询结果", job_id=job["id"], status=job["status"],
+            hint=f"先填好 request.md，再跑 cgh submit --id {job['id']}")
 
     def _release(p):
         """wait 持有连接时不能关——一关 override 就没了。"""
@@ -1209,8 +1259,6 @@ def _poll_once(d, job_id, hold=None, resume=False):
                     j["conversation_url"] = prog["url"]
                     j["notes"].append(f"{now()} 已从原标签页回读正式会话 URL")
                     save_job(d, j)
-        sentinel = f"CGH_END_{job['id']}" in prog["tail"]
-
         # 前轮仍在更新、或旧消息被虚拟化移出 DOM 时，计数/尾部变化都不能证明归属。
         # 本作业完整结果可独立确认；无标记回复则必须位于本轮已发送用户消息之后。
         own_result = job["id"] in prog["assistant_job_ids"]
@@ -1237,29 +1285,40 @@ def _poll_once(d, job_id, hold=None, resume=False):
                   "定位失败：无法识别对话消息，不能把 0 字当作仍在生成",
                   hint=f"人工看一眼 {job.get('conversation_url')}")
 
-        # 「长度不变」只算一次微弱证据。连续两次都不变才承认它停了——
-        # 单次相同区分不了「真结束」和「渲染临时停顿」，而 no_sentinel 是终态、误判就废掉这个作业。
+        # 全文指纹覆盖等长替换；缺哨兵时还必须有本轮已完成的正向证据。
         # 本轮空助手节点仍是等待状态；空的其他轮次可稳定后报归属错误。
-        stalled_now = (prog["len"] > 0 or not own_user) and prog["len"] == job.get("last_len", 0)
+        raw_sig = sha256(raw)
+        stalled_now = (prog["len"] > 0 or not own_user) and raw_sig == job.get("last_raw_sha256")
         stalled = stalled_now and job.get("stalled_count", 0) >= 1
+        replying = prog["generating"] or prog.get("reply_state") == "in_progress"
 
-        if not prog["generating"] and prog.get("has_send_btn") and stalled and not own_result:
+        if not replying and prog.get("has_send_btn") and stalled and not own_result:
             foreign = _foreign_result_ids(raw, job["id"])
             if not own_user or (new_turn and stalled and foreign):
                 page.close()
                 _mark(d, job["id"], "failed", "result_mismatch",
                       "当前请求或回复无法归属于本作业；保留页面，未写入 raw/result",
                       found=foreign, user_job_ids=prog["user_job_ids"])
+            if new_turn and raw and prog.get("reply_state") != "complete":
+                try:
+                    web.save_failed_page(page, d / job["id"])
+                except (cdp.CdpError, OSError):
+                    pass
+                page.close()
+                _mark(d, job["id"], "ui_changed", "ui_changed",
+                      "未识别到本轮回复的完成状态，不能把暂时稳定的正文当作最终结果",
+                      hint=f"核对页面后 cgh wait --id {job['id']} --resume")
 
         # 停止按钮可能在切换布局时短暂消失；还要有可见发送按钮这一正向空闲证据。
-        if (prog["generating"] or not prog.get("has_send_btn") or not new_turn
-                or (not sentinel and not stalled)):
+        if (replying or not prog.get("has_send_btn") or not new_turn
+                or (not own_result and (not stalled or prog.get("reply_state") != "complete"))):
             with Lock(d):
                 job = load_job(d, job["id"])
                 job["status"] = "generating"
                 job["poll_count"] = job.get("poll_count", 0) + 1
                 job["stalled_count"] = (job.get("stalled_count", 0) + 1) if stalled_now else 0
                 job["last_len"] = prog["len"]
+                job["last_raw_sha256"] = raw_sig
                 save_job(d, job)
             _release(page)
             return False, dict(job_id=job["id"], status="generating", chars=prog["len"],
@@ -1735,7 +1794,7 @@ def main():
     s = sub.add_parser("poll", help="读一次生成状态；完成则自动取全文并解析成 result.md")
     s.add_argument("--id")
     s.add_argument("--resume", action="store_true",
-                   help="作业被传输层抖动误判成失败、但对话还在时，接着等它")
+                   help="从失败或 no_sentinel 恢复收取已有对话；不重发，保留不同的旧原文")
     s.set_defaults(fn=cmd_poll)
 
     s = sub.add_parser("wait", help="阻塞轮询到出结果（AI 自己等，不用人反复说 poll）")
@@ -1743,7 +1802,7 @@ def main():
     s.add_argument("--timeout", type=int, default=1800, help="最多等多少秒，默认 1800（Pro 档够用）")
     s.add_argument("--interval", type=int, default=20, help="两次读之间隔多少秒，默认 20")
     s.add_argument("--resume", action="store_true",
-                   help="作业被传输层抖动误判成失败、但对话还在时，接着等它")
+                   help="从失败或 no_sentinel 恢复收取已有对话；不重发，保留不同的旧原文")
     s.set_defaults(fn=cmd_wait)
 
     s = sub.add_parser("doctor", help="开工自检：9222 / ChatGPT 标签页 / 登录态")

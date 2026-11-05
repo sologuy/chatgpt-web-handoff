@@ -29,6 +29,14 @@ No credentials touched, stored, or moved — it drives the session you're alread
 
 ---
 
+## v0.7.3 · 2026-11-05
+
+- **Reply completion checks:** replies without a complete result marker require the current turn to be complete and the full text to be stable. Pauses and equal-length changes no longer count as completion.
+- **Recover incomplete results:** `poll/wait --resume` can collect `no_sentinel` replies again, preserving different previous raw text without resending. The per-repository single-active-job limit still applies.
+- **Manual source and tier fixes:** reject clear whole-page input containing a user Handoff template and assistant turns while allowing normal quotations; product names containing `Pro` do not override explicit Chinese tier instructions.
+- **Polling before submission:** return `not_submitted` without changing the job. Submitted jobs can still reopen a closed tab using the original conversation URL.
+- **Attachment send readiness:** briefly wait for a disabled send button to become ready before the first click, avoiding premature failures and repeated uploads while attachments are still processing.
+
 ## v0.7.2 · 2026-11-05
 
 - **Verified composer clearing:** stop before pasting if the old draft cannot be cleared; retries cannot append another copy of the request.
@@ -188,6 +196,9 @@ missing_information: […]
 Nothing is summarized away, no dissenting point is dropped, no uncertain claim is
 promoted to a certain one. If ChatGPT doesn't close with the required block, you get
 `no_sentinel` and the raw text — never a model-invented field.
+If the reply later completes on the page, use `cgh wait --id <job_id> --resume` to collect it again.
+Different previous raw text is preserved as `raw-last-message.prev-<hash>.txt` in the job directory.
+Manual `parse` returns `full_page_input` for clear whole-page input without trimming or rewriting it.
 
 ## How it works
 
