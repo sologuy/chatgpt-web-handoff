@@ -681,9 +681,24 @@ def cmd_parse(a):
        recommended_actions=len(parsed["recommended_actions"]))
 
 
+def _foreign_result_ids(raw, job_id):
+    blocks = list(re.finditer(r"CGH_RESULT_(hf_\d{8}_[a-z0-9]{6})\b[\s\S]*?CGH_END_\1\b", raw))
+    ids = {m[1] for m in blocks}
+    if not ids or job_id in ids:
+        return []
+    # 引用旧块后开始了本轮但输出被截断，仍应保留为本轮 no_sentinel。
+    if re.search(rf"CGH_RESULT_{re.escape(job_id)}\b", raw[blocks[-1].end():]):
+        return []
+    return sorted(ids)
+
+
 def _store_parse(d, job, raw):
     """写 raw-last-message.txt + 解析哨兵 + 落 result.md。调用方须持锁。"""
     jd = d / job["id"]
+    foreign = _foreign_result_ids(raw, job["id"])
+    if foreign:
+        die("result_mismatch", "原文中的完整结果属于其他作业，未写入本作业",
+            job_id=job["id"], found=foreign)
     (jd / "raw-last-message.txt").write_text(raw, encoding="utf-8")
     parsed, err = parse_sentinel(raw, job["id"])
     if err:
@@ -728,6 +743,8 @@ def _classify(exc):
         return "remote_debug_denied", "remote_debug_denied"
     if "解冻失败" in m:
         return "ui_changed", "background_unfreeze_failed"
+    if "输入框清空失败" in m:
+        return "failed", "composer_clear_failed"
     if "注入形态不对" in m:
         # 内联和附件两条路都没走通。这条消息里也带「附件数 x → y」，但根因通常
         # 与附件无关（比如正文被 UI 改写过），归到 attachment_state 会把人
@@ -761,7 +778,7 @@ def _format_tail(job_id, body):
     ms = re.findall(rf"(```+\s*\n?CGH_RESULT_{re.escape(job_id)}.*?CGH_END_{re.escape(job_id)}\s*\n?```+)",
                     body, re.S)
     block = ms[-1] if ms else None
-    head = "附件是完整的交接正文，请通读后作答。"
+    head = f"# Handoff {job_id}\n附件是完整的交接正文，请通读后作答。"
     if not block:
         return head + f"回答最后请用 fenced code block 原样输出 CGH_RESULT_{job_id} … CGH_END_{job_id} 结构化块。"
     return head + "回答的最后，请用一个 fenced code block 原样输出下面这段，字段名与顺序不要改：\n\n" + block
@@ -809,7 +826,7 @@ def _submit_locked(a):
         # 这些都没跨过发送边界，request.md 也填好了，逼人重建一遍纯属浪费。
         # 成功终态（completed / no_sentinel）不给这条路——那是「已经拿到回答」，
         # 重投就是白花一次额度。发送幂等闸门在下面，仍然照常拦。
-        retryable = job["status"] in ERROR_TERMINAL and not job.get("send_attempted_at")
+        retryable = job["status"] in ERROR_TERMINAL and (not job.get("send_attempted_at") or a.force_resend)
         if not (a.force and retryable):
             die("terminal", f"作业已是终态：{job['status']}",
                 hint=(f"这是工具侧失败且未发送过，修好之后可以 cgh submit --id {job['id']} --force 重投"
@@ -853,6 +870,10 @@ def _submit_locked(a):
             f"request.md 的哨兵带的是别的作业 id：{', '.join(stale)}",
             expected=job["id"], found=stale,
             hint="正文是从别的作业抄来的？把 CGH_RESULT_/CGH_END_ 后面的 id 换成本作业的")
+    if (not re.match(rf"\s*#\s*Handoff\s+{re.escape(job['id'])}\b", body)
+            or f"CGH_RESULT_{job['id']}" not in body or f"CGH_END_{job['id']}" not in body):
+        die("sentinel_missing", "request.md 须保留首行 Handoff 作业编号和本作业起止标记，才能核验回合归属",
+            job_id=job["id"])
 
     holes = _unfilled_placeholders(body)
     if holes and not a.force:
@@ -881,15 +902,16 @@ def _submit_locked(a):
             web.clear_verified_draft(page)
             _checkpoint_draft(d, a.id, target_id, web.inspect_draft_state(page))
         web.guard_host(page)
+        web.require_idle(page)
         turns_before = web.count_assistant(page) if continuing else 0
-        # 条数不可靠（虚拟化会把旧消息移出 DOM），所以另记一份内容指纹：
-        # 只要最后一条助手消息的内容变了，就说明新回合已经出现。
-        # 这条判据既不依赖计数单调，也不依赖对方守哨兵格式。
+        # 保留发送前计数/指纹供诊断；轮次归属另以已发送的用户消息核验。
         tail_before = _tail_sig(web.read_progress(page)) if continuing else None
         # 附件先传、正文后注入：上传是异步的，等它落定的时候正文还没进去，
         # 万一超时也不用回滚已经打好的字。
         atts = job.get("attachments") or []
         uploaded = None
+        if continuing and not atts and web.drop_uploads(page):
+            raise cdp.CdpError("输入框里有清不掉的遗留上传件，未注入或发送")
         if atts:
             gone = [a["name"] for a in atts if not Path(a["path"]).exists()]
             if gone:
@@ -950,7 +972,7 @@ def _submit_locked(a):
                 fresh["send_attempted_at"] = now()
                 fresh["page_id"] = target_id
                 if continuing:
-                    # 记下发送前的现场：poll 要靠它区分「新回合」与「上一轮的旧回答」
+                    # 记下发送前的现场供诊断，不能单凭计数/指纹变化认定新回合。
                     fresh["turns_before"] = turns_before
                     fresh["tail_before"] = tail_before
                 save_job(d, fresh)          # 先落盘再按发送：崩在中间也留得下痕迹
@@ -974,11 +996,11 @@ def _submit_locked(a):
                         save_job(d, j)
                     page.close()
                     die("send_not_taken", str(e), job_id=a.id,
-                        hint="确证未发送、不消耗额度，直接重跑 submit 即可")
+                        hint="未点击或确证未发送；检查页面就绪后可重试 submit")
                 if continuing:
                     # 续聊时 URL 不变，wait_conversation_url 会立刻返回、等于没验。
-                    # 改看真实证据：新回合出现（助手消息数增加或停止按钮亮起）。
-                    web.wait_new_turn(page, turns_before)
+                    # 必须看到带本作业标记的已发送用户消息。
+                    web.wait_new_turn(page, job["id"])
                     url = web.wait_conversation_url(page)
                 else:
                     url = web.wait_conversation_url(page)
@@ -997,6 +1019,11 @@ def _submit_locked(a):
             f"另一个浏览器任务正在设档位/发送，等了 {e.timeout}s 仍未释放",
             lock=str(e.path),
             hint="检查正在提交的进程；进程退出后锁会自动释放，不要删除锁文件")
+    except web.ConversationBusy as e:
+        if page:
+            page.close()
+        die("conversation_busy", str(e), job_id=a.id,
+            status=load_job(d, a.id)["status"], hint="未发送，等待前轮结束后可直接重试 submit")
     except web.EffortNotFound as e:
         if page:
             page.close()
@@ -1048,25 +1075,48 @@ def cmd_confirm(a):
 
     比让用户手搓 `cgh update` 好：这里知道该同时补哪几个字段、该做哪些校验。
     """
+    import cgh_cdp as cdp
     import cgh_web as web
     d = handoffs_dir(repo_root(a.root))
+    job = load_job(d, a.id)
+    if job["status"] in TERMINAL:
+        die("terminal", f"作业已是终态：{job['status']}，不覆盖已有结果")
+    if not job.get("send_attempted_at") and not a.force:
+        die("not_sent", "这个作业没有跨过发送边界，没什么可确认的", status=job["status"])
+    url = a.url.strip()
+    if web.is_temporary_conversation_url(url):
+        die("bad_url", "这是客户端临时 id，事后打不开。在浏览器里等它变成真 id 再抄", got=url)
+    if not web.is_conversation_url(url):
+        die("bad_url", "对话 URL 形如 https://chatgpt.com/c/<id>", got=url)
+    if job.get("continue_from") and url.split("?")[0].split("#")[0] != job["continue_from"].split("?")[0].split("#")[0]:
+        die("conversation_mismatch", "续聊只能确认原对话，未修改作业", expected=job["continue_from"])
+    page = None
+    opened = []
+    try:
+        page, target_id, _ = web.attach_or_open(job.get("page_id"), url, on_reopen=opened.append)
+        prog = web.read_progress(page)
+        if prog["url"].split("?")[0].split("#")[0] != url.split("?")[0].split("#")[0]:
+            die("conversation_mismatch", "当前标签页与待确认的对话 URL 不一致，未修改作业", page_id=target_id)
+        if job["id"] not in prog["user_job_ids"]:
+            die("turn_unverified", "未看到本作业已发送的用户消息；仅有对话 URL 不能确认发送",
+                job_id=job["id"], page_id=target_id, found=prog["user_job_ids"])
+    except (cdp.CdpError, OSError) as e:
+        _, code = _classify(e)
+        die(code, str(e), job_id=job["id"], page_id=opened[-1] if opened else job.get("page_id"))
+    finally:
+        if page:
+            page.close()
     with Lock(d):
         job = load_job(d, a.id)
-        if not job.get("send_attempted_at") and not a.force:
-            die("not_sent", "这个作业没有跨过发送边界，没什么可确认的",
-                status=job["status"])
-        url = a.url.strip()
-        if web.is_temporary_conversation_url(url):
-            die("bad_url", "这是客户端临时 id，事后打不开。在浏览器里等它变成真 id 再抄",
-                got=url)
-        if not web.is_conversation_url(url):
-            die("bad_url", "对话 URL 形如 https://chatgpt.com/c/<id>", got=url)
+        if job["status"] in TERMINAL:
+            die("terminal", f"核验期间作业已结束：{job['status']}，未覆盖")
         job["conversation_url"] = url
+        job["page_id"] = target_id
         job["status"] = "submitted"
         job["submitted_at"] = job.get("submitted_at") or now()
         job["error"] = None
         job["pending_page"] = None
-        job["notes"].append(f"{now()} 人工确认发送成功：{url}")
+        job["notes"].append(f"{now()} 已核验本轮用户消息，确认发送成功：{url}")
         save_job(d, job)
     ledger_append("submitted", root_of(d), job, confirmed_by_human=True)
     ok(job_id=job["id"], status="submitted", conversation_url=url,
@@ -1149,7 +1199,8 @@ def _poll_once(d, job_id, hold=None, resume=False):
                     j = load_job(d, job["id"])
                     j["page_id"] = tid
                     save_job(d, j)
-        prog = web.read_progress(page)
+        prog = web.read_response(page)
+        raw = prog.pop("text")
         if (web.is_temporary_conversation_url(job.get("conversation_url"))
                 and web.is_conversation_url(prog.get("url"))):
             with Lock(d):
@@ -1160,23 +1211,11 @@ def _poll_once(d, job_id, hold=None, resume=False):
                     save_job(d, j)
         sentinel = f"CGH_END_{job['id']}" in prog["tail"]
 
-        # 续聊时最后一条助手消息一开始还是上一轮那条（已完成、且不含本轮哨兵）。
-        # 不排除掉它，连续两次读到同一条就会被判成「停了」，把上一轮的答案
-        # 当作本轮结果落成 no_sentinel 终态。
-        # ChatGPT 会虚拟化长对话：旧的助手消息被移出 DOM，assistant_msgs 因此**不单调递增**。
-        # 续聊轮次一多，count 就停在原地，"新回合出现了吗"永远判不出来，poll 卡死在 generating。
-        # 哨兵串里带本作业的 job_id，上一轮的回答里不可能出现 —— 它出现即证明这是本轮的新回合。
-        # 判「新回合出现了没有」有三条独立判据，任一成立即可 —— 单靠哪一条都会漏：
-        #   ① 助手消息数增加 —— 但 ChatGPT 虚拟化长对话会把旧消息移出 DOM，条数不单调递增
-        #   ② 本作业的哨兵出现 —— 但对方不守格式时就没有哨兵
-        #   ③ 最后一条助手消息的内容指纹变了 —— 对上面两种情况都免疫
-        # 只有三条全不成立才继续等，这样既不会把上一轮的答案当本轮结果，也不会卡死。
-        tb = job.get("turns_before")
-        tsb = job.get("tail_before")
-        new_turn = (tb is None
-                    or prog.get("assistant_msgs", 0) > tb
-                    or sentinel
-                    or (tsb is not None and _tail_sig(prog) != tsb))
+        # 前轮仍在更新、或旧消息被虚拟化移出 DOM 时，计数/尾部变化都不能证明归属。
+        # 本作业完整结果可独立确认；无标记回复则必须位于本轮已发送用户消息之后。
+        own_result = job["id"] in prog["assistant_job_ids"]
+        own_user = job["id"] in prog["user_job_ids"]
+        new_turn = own_result or (own_user and prog["assistant_after_user"])
 
         # 页面结构还认得出来吗？认不出来就不能拿「没有停止按钮」当「生成完了」——
         # ChatGPT 改个 testid，每次 poll 都会立刻看起来像"已完成"，静默给出半截结果。
@@ -1200,8 +1239,17 @@ def _poll_once(d, job_id, hold=None, resume=False):
 
         # 「长度不变」只算一次微弱证据。连续两次都不变才承认它停了——
         # 单次相同区分不了「真结束」和「渲染临时停顿」，而 no_sentinel 是终态、误判就废掉这个作业。
-        stalled_now = prog["len"] > 0 and prog["len"] == job.get("last_len", 0)
+        # 本轮空助手节点仍是等待状态；空的其他轮次可稳定后报归属错误。
+        stalled_now = (prog["len"] > 0 or not own_user) and prog["len"] == job.get("last_len", 0)
         stalled = stalled_now and job.get("stalled_count", 0) >= 1
+
+        if not prog["generating"] and prog.get("has_send_btn") and stalled and not own_result:
+            foreign = _foreign_result_ids(raw, job["id"])
+            if not own_user or (new_turn and stalled and foreign):
+                page.close()
+                _mark(d, job["id"], "failed", "result_mismatch",
+                      "当前请求或回复无法归属于本作业；保留页面，未写入 raw/result",
+                      found=foreign, user_job_ids=prog["user_job_ids"])
 
         # 停止按钮可能在切换布局时短暂消失；还要有可见发送按钮这一正向空闲证据。
         if (prog["generating"] or not prog.get("has_send_btn") or not new_turn
@@ -1218,7 +1266,6 @@ def _poll_once(d, job_id, hold=None, resume=False):
                                poll_count=job["poll_count"], generating=prog["generating"],
                                stalled_count=job["stalled_count"])
 
-        raw = web.read_full(page)
         page.close()
     except (cdp.CdpError, OSError) as e:
         if page:

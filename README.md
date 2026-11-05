@@ -29,6 +29,13 @@ No credentials touched, stored, or moved — it drives the session you're alread
 
 ---
 
+## v0.7.2 · 2026-11-05
+
+- **Verified composer clearing:** stop before pasting if the old draft cannot be cleared; retries cannot append another copy of the request.
+- **Follow-up ownership:** wait for the previous generation, verify the submitted user message, and reject another job's reply without saving it as the current result. Long folded prompts retain their `# Handoff <job_id>` header.
+- **Wait for reply text:** empty assistant nodes remain pending instead of being saved as empty results; attachment cards do not obscure the job ID in the first line of the message body.
+- **Recovery checks:** `confirm` verifies the conversation and current user message; `result_mismatch` can resume after the page is corrected. No automatic resend.
+
 ## v0.7.1 · 2026-11-01
 
 - **Speaker heading compatibility:** shared message detection ignores hidden print-only names, fixing `ui_changed` when completed replies were read as zero messages.
