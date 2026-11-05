@@ -72,6 +72,7 @@ $CGH new --action review --attach ./bug.png --attach ./trace.log -- <要审什�
   这句话会被冻结进 `intent.json` 并带哈希，后续任何环节改动它都会被拒绝，
   档位交叉校验也是拿它做的信源。
 - 五个档位：`极速` / `中级` / `高级` / `极高` / `pro`。没有 `auto` 这一档。
+- `Pro` 只在明确的档位/模型使用语境中识别；`MacBook Pro`、`Yoga Slim 7 Pro` 等设备名不覆盖中文档位指令。
 - 审查对象会被冻结进 `intent.json` 并带哈希，`submit` 会校验它原样出现在 `request.md`
   的「目标」节里——防的是建完作业之后正文被改跑题，不是防你写。
 - 上下文里有多个合理审查对象，或者选哪个会实质改变范围 → **停下来问**，不得擅自挑选。
@@ -127,13 +128,14 @@ $CGH wait --id <job_id> --timeout 1800
 - 返回 `completed`：读 `result.md`，把 `verdict` / `confidence` / `summary` /
   `findings` / `recommended_actions` 复述给用户，附上 `result.md` 路径与对话 URL。
 - 返回 `timed_out: true`：**不是失败**，作业还活着。再跑一次 `wait` 接着等。
-- 返回 `no_sentinel`：ChatGPT 没按格式收尾，原文已存，交用户判断。
+- 返回 `no_sentinel`：已完成的回复缺少有效格式，原文已存。若网页后来补全，使用 `wait --id <job_id> --resume` 重收，不重新提交；不同的旧原文保存在 `raw-last-message.prev-<hash>.txt`。
 - 返回 `ui_changed`：保留原页和错误。定位问题修复并验证后，确认最新助手回复仍对应本作业，才用 `$CGH wait --id <job_id> --resume` 恢复收取，不重新提交。
 - 返回 `result_mismatch`：当前请求或回复无法归属于本作业，未保存成该作业的原文。核对页面和本轮用户消息，恢复正确现场后用 `wait --resume`；不能只凭同一个对话 URL 确认发送。
 
 手工 `parse --from` 的来源必须是**对应助手消息容器中的原文**：先确认生成结束，
 并核对本作业完整的 `CGH_RESULT_<job_id>` / `CGH_END_<job_id>`。禁止把整页
 `document.body.innerText`、用户提示模板或前轮对话当作本轮助手原文；不能自行补写字段。
+检测到明确整页结构时返回 `full_page_input`，不改作业文件。正常引用与离线单条回复仍可解析。
 
 Pro 档实测约 10 分钟，前几分钟 `chars=0` 是正常的思考阶段，不是卡住了。
 `wait` 会自己等到底，**这不构成用 Pro 的成本**——你不需要盯着，用户也不需要。
@@ -243,7 +245,9 @@ $CGH backfill                                # 补本仓库缺失事件（按 id
 | `ui_changed` + 「上传件」字样 | 附件传不上去或有清不掉的遗留上传件 | 让用户看一眼那个标签页的输入框。**不要重试**，重试会把文件重复传上去 |
 | `rate_limited` | 撞额度 | **不自动重投** |
 | `inject_mismatch` | 正文粘进去了，但落入的字数与预期对不上 | 报出两个数字。**不要直接重投**——先确认是不是正文里有会被 UI 改写的内容（URL 会被转成 pill、显示时藏掉 scheme+host）。这条报错本身也可能是 cgh 的量法过时了 |
-| `no_sentinel` | ChatGPT 没按格式收尾 | 原文已存 `raw-last-message.txt`，交用户判断。**不要自己补字段、不要重跑** |
+| `no_sentinel` | 已完成的回复缺有效格式 | 原文已存；网页补全后可 `wait --resume` 重收，保留不同的旧原文。不要补字段或重新发送 |
+| `not_submitted` | 作业尚未发送 | 状态未改；填好 request.md 后执行 submit |
+| `full_page_input` | 手工 parse 混入用户模板与助手回合 | 文件未改；从原网页 `wait --resume` 收取，或只复制对应助手消息 |
 
 ---
 
